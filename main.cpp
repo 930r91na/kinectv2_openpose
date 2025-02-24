@@ -1,10 +1,11 @@
 #include "KinectDepthChecker.h"
 #include <iostream>
-
 #include "spdlog/spdlog.h"
-#include "spdlog/details/os-inl.h"
 
 int main() {
+    // Disable OpenCv logging
+    setLogLevel(cv::utils::logging::LOG_LEVEL_ERROR);
+
     try {
         if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
             std::cout << "Failed to initialize COM" << std::endl;
@@ -22,7 +23,18 @@ int main() {
             return -1;
         }
 
-        checker.checkDepthFPS(10);
+        checker.checkDepthFPS(5);
+
+        // Main processing loop
+        bool running = true;
+        while (running) {
+            checker.update();
+
+            // Exit on 'q' press
+            if (cv::waitKey(30) == 'q') {
+                running = false;
+            }
+        }
 
         CoUninitialize();
     }
