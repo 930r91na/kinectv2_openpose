@@ -36,12 +36,28 @@ void KinectDepthChecker::setupLogger() {
     }
 }
 
+cv::Mat KinectDepthChecker::getColorImage() const {
+	if (colorImg.empty()) {
+		return cv::Mat();
+	}
+
+	return colorImg.clone();
+}
+
+cv::Mat KinectDepthChecker::getDepthImage() const {
+	if (depthImg.empty()) {
+		return cv::Mat();
+	}
+	return depthImg.clone();
+}
+
 KinectDepthChecker::KinectDepthChecker() :
     m_pKinectSensor(nullptr),
     m_pDepthFrameReader(nullptr),
     m_pCoordinateMapper(nullptr),
     m_pBodyFrameReader(nullptr),
     m_pBodyIndexFrameReader(nullptr),
+	m_pColorFrameReader(nullptr),
     initialized(false) {
     setupLogger();
     logger->info("KinectDepthChecker initialized");
@@ -52,6 +68,8 @@ KinectDepthChecker::~KinectDepthChecker() {
     SafeRelease(m_pBodyFrameReader);
     SafeRelease(m_pBodyIndexFrameReader);
     SafeRelease(m_pCoordinateMapper);
+	SafeRelease(m_pBodyFrameReader);
+	SafeRelease(m_pColorFrameReader);
 
     if (m_pKinectSensor) {
         m_pKinectSensor->Close();
@@ -90,6 +108,19 @@ bool KinectDepthChecker::initialize() {
         SafeRelease(depthFrameSource);
     }
 
+	// Get color reader
+	IColorFrameSource* colorFrameSource = nullptr;
+	hr = m_pKinectSensor->get_ColorFrameSource(&colorFrameSource);
+	if (SUCCEEDED(hr)) {
+		hr = colorFrameSource->OpenReader(&m_pColorFrameReader);
+		if (FAILED(hr)) {
+			logger->error("Failed to create color frame reader");
+		} else {
+			logger->info("Color frame reader created successfully");
+		}
+		SafeRelease(colorFrameSource);
+	}
+
     // Get body reader
     IBodyFrameSource* bodyFrameSource = nullptr;
     hr = m_pKinectSensor->get_BodyFrameSource(&bodyFrameSource);
@@ -115,6 +146,7 @@ bool KinectDepthChecker::initialize() {
     // Initialize Mat objects
     skeletonImg = cv::Mat(cDepthHeight, cDepthWidth, CV_8UC3);
     depthImg = cv::Mat(cDepthHeight, cDepthWidth, CV_8UC1);
+	colorImg = cv::Mat(cColorHeight, cColorWidth, CV_8UC4);
 
     initialized = true;
     logger->info("Kinect initialization completed successfully");
@@ -141,6 +173,47 @@ void KinectDepthChecker::update() {
 
 		delete[] depthArray;
 		SafeRelease(pDepthFrame);
+	}
+
+	// Process color frame
+	IColorFrame* pColorFrame = nullptr;
+	hr = m_pColorFrameReader->AcquireLatestFrame(&pColorFrame);
+	if (SUCCEEDED(hr)) {
+		// Get color frame description
+		IFrameDescription* colorFrameDescription = nullptr;
+		hr = pColorFrame->get_FrameDescription(&colorFrameDescription);
+
+		if (SUCCEEDED(hr)) {
+			int width = 0, height = 0;
+			colorFrameDescription->get_Width(&width);
+			colorFrameDescription->get_Height(&height);
+
+			// Make sure our Mat is the right size
+			if (colorImg.cols != width || colorImg.rows != height) {
+				colorImg = cv::Mat(height, width, CV_8UC4);
+			}
+
+			// Copy the color data to our Mat
+			hr = pColorFrame->CopyConvertedFrameDataToArray(
+				width * height * 4,  // 4 bytes per pixel (BGRA)
+				reinterpret_cast<BYTE*>(colorImg.data),
+				ColorImageFormat_Bgra
+			);
+
+			if (SUCCEEDED(hr)) {
+				logger->debug("Color frame acquired successfully");
+				// Optionally display the color image
+				cv::Mat colorDisplay;
+				cv::resize(colorImg, colorDisplay, cv::Size(), 0.5, 0.5); // Resize for display
+				cv::imshow("Color Image", colorDisplay);
+			} else {
+				logger->error("Failed to copy color frame data");
+			}
+
+			SafeRelease(colorFrameDescription);
+		}
+
+		SafeRelease(pColorFrame);
 	}
 
 	// Process body frame

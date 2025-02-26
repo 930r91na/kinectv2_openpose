@@ -15,14 +15,20 @@ inline void SafeRelease(Interface*& pInterfaceToRelease) {
 }
 
 class KinectDepthChecker {
+    // Resolution constants
     static constexpr int cDepthWidth = 512;
     static constexpr int cDepthHeight = 424;
+    // Constants for color resolution
+    static constexpr int cColorWidth = 1920;
+    static constexpr int cColorHeight = 1080;
 
     IKinectSensor* m_pKinectSensor;
     IDepthFrameReader* m_pDepthFrameReader;
+    IColorFrameReader* m_pColorFrameReader;
     ICoordinateMapper* m_pCoordinateMapper;
     IBodyFrameReader* m_pBodyFrameReader;
     IBodyIndexFrameReader* m_pBodyIndexFrameReader;
+
     bool initialized;
     std::shared_ptr<spdlog::logger> logger;
 
@@ -31,6 +37,8 @@ class KinectDepthChecker {
     // Mat objects for visualization
     cv::Mat skeletonImg;
     cv::Mat depthImg;
+    cv::Mat colorImg;
+
 
 public:
     KinectDepthChecker();
@@ -43,6 +51,10 @@ public:
     bool initialize();
     void update();
     void checkDepthFPS(int durationSeconds = 10) const;
+    cv::Mat getColorImage() const;
+    cv::Mat getDepthImage() const;
+    ICoordinateMapper* getCoordinateMapper() const { return m_pCoordinateMapper; }
+
 
 private:
     // Functions to process skeleton
