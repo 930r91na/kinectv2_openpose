@@ -32,7 +32,12 @@ int main() {
 
         // Initialize Kinect
         KinectDepthChecker kinect;
-        if (!kinect.initialize()) {
+
+        bool init = kinect.initialize();
+        spdlog::info("Waiting for Kinect to fully initialize...");
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+
+        if (!init) {
             spdlog::error("Failed to initialize Kinect");
             CoUninitialize();
             return -1;
@@ -43,7 +48,7 @@ int main() {
 
         // Initialize OpenPose with path to executable
         // Update this path to match your OpenPose installation
-        OpenPoseCapture openpose("bin\\OpenPoseDemo.exe");
+        OpenPoseCapture openpose("C:\\Users\\koqui\\OpenPose\\openpose\\bin\\OpenPoseDemo.exe");
 
         // Configure OpenPose settings
         openpose.setNetResolution(368);       // Default balanced resolution

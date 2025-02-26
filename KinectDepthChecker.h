@@ -38,6 +38,7 @@ class KinectDepthChecker {
     cv::Mat skeletonImg;
     cv::Mat depthImg;
     cv::Mat colorImg;
+    cv::Mat rawDepthImg;
 
 
 public:

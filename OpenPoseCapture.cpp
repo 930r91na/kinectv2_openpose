@@ -82,26 +82,38 @@ bool OpenPoseCapture::initialize() {
 }
 
 bool OpenPoseCapture::runOpenPoseOnImage(const std::string& imagePath, const std::string& outputDir) const {
-    // Construct OpenPose command with optimal parameters
+    // Extract the OpenPose root directory from the executable path
+    std::string openPoseDir = openPoseExePath;
+    size_t binPos = openPoseDir.find("\\bin\\");
+    if (binPos == std::string::npos) {
+        spdlog::error("Cannot determine OpenPose root directory from path: {}", openPoseExePath);
+        return false;
+    }
+    openPoseDir = openPoseDir.substr(0, binPos);
+
+    // Get absolute paths for input and output directories
+    std::string absImagePath = fs::absolute(imagePath).string();
+    std::string absOutputDir = fs::absolute(outputDir).string();
+
+    // Build command that first changes to OpenPose directory then runs the executable
     std::stringstream cmd;
+    cmd << "cd /d \"" << openPoseDir << "\" && "
+        << "bin\\OpenPoseDemo.exe"  // Use relative path since we're already in the OpenPose directory
+        << " --image_dir \"" << absImagePath << "\""
+        << " --write_json \"" << absOutputDir << "\""
+        << " --display 0"
+        << " --render_pose 0";
 
-    cmd << "\"" << openPoseExePath << "\"";
-    cmd << " --image_dir \"" << imagePath << "\"";
-    cmd << " --write_json \"" << outputDir << "\"";
-    cmd << " --display 0";  // Don't display UI for performance
-    cmd << " --render_pose 0"; // Don't render for performance
-
-    // Add accuracy settings if enabled
+    // Add accuracy settings
     if (useMaximumAccuracy) {
-        cmd << " --net_resolution \"1312x736\"";
-        cmd << " --scale_number 4";
-        cmd << " --scale_gap 0.25";
+        cmd << " --net_resolution 1312x736"
+            << " --scale_number 4"
+            << " --scale_gap 0.25";
     } else {
-        // Balanced performance mode
-        cmd << " --net_resolution \"-1x" << netResolution << "\"";
+        cmd << " --net_resolution -1x" << netResolution;
     }
 
-    spdlog::debug("Running OpenPose command: {}", cmd.str());
+    spdlog::info("Running OpenPose command: {}", cmd.str());
 
     // Execute command
     int result = std::system(cmd.str().c_str());
@@ -158,6 +170,17 @@ bool OpenPoseCapture::processFrame(const cv::Mat& colorImage, const cv::Mat& dep
     if (colorImage.empty() || depthImage.empty() || !coordinateMapper) {
         spdlog::error("Invalid inputs to processFrame");
         return false;
+    }
+
+    // Convert depth image to proper format if needed
+    cv::Mat depthMat16U;
+    if (depthImage.type() != CV_16UC1) {
+        spdlog::info("Converting depth image from type {} to CV_16UC1", depthImage.type());
+        // If our depth image is 8-bit (visualization), we need the original data
+        // This is just a fallback - you should pass the original 16-bit depth data
+        depthImage.convertTo(depthMat16U, CV_16UC1, 65535.0/255.0);
+    } else {
+        depthMat16U = depthImage;
     }
 
     // Save the color image to temp directory
@@ -255,7 +278,7 @@ bool OpenPoseCapture::processFrame(const cv::Mat& colorImage, const cv::Mat& dep
                         int depthY = static_cast<int>(depthPoint.Y);
 
                         // Check if within depth image bounds
-                        if (depthX >= 0 && depthX < depthWidth && depthY >= 0 && depthY < depthHeight) {
+                        if (depthX >= 0 && depthX < depthMat16U.cols && depthY >= 0 && depthY < depthMat16U.rows) {
                             // Get depth value at this point
                             UINT16 depth = depthImage.at<UINT16>(depthY, depthX);
 

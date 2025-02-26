@@ -45,10 +45,10 @@ cv::Mat KinectDepthChecker::getColorImage() const {
 }
 
 cv::Mat KinectDepthChecker::getDepthImage() const {
-	if (depthImg.empty()) {
+	if (rawDepthImg.empty()) {
 		return cv::Mat();
 	}
-	return depthImg.clone();
+	return rawDepthImg.clone();
 }
 
 KinectDepthChecker::KinectDepthChecker() :
@@ -166,6 +166,7 @@ void KinectDepthChecker::update() {
 	if (SUCCEEDED(hr)) {
 		UINT16* depthArray = new UINT16[cDepthHeight * cDepthWidth];
 		pDepthFrame->CopyFrameDataToArray(cDepthHeight * cDepthWidth, depthArray);
+		rawDepthImg = cv::Mat(cDepthHeight, cDepthWidth, CV_16UC1, depthArray).clone();
 
 		// Normalize depth data for better visualization
 		cv::Mat depthMat(cDepthHeight, cDepthWidth, CV_16UC1, depthArray);
