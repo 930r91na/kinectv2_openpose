@@ -203,10 +203,6 @@ void KinectDepthChecker::update() {
 
 			if (SUCCEEDED(hr)) {
 				logger->debug("Color frame acquired successfully");
-				// Optionally display the color image
-				cv::Mat colorDisplay;
-				cv::resize(colorImg, colorDisplay, cv::Size(), 0.5, 0.5); // Resize for display
-				cv::imshow("Color Image", colorDisplay);
 			} else {
 				logger->error("Failed to copy color frame data");
 			}

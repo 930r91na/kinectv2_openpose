@@ -9,15 +9,17 @@
 
 namespace fs = std::filesystem;
 
-OpenPoseCapture::OpenPoseCapture(std::string  openPosePath,
-                               std::string  tempDir,
-                               std::string  jsonDir)
+OpenPoseCapture::OpenPoseCapture(std::string openPosePath,
+                               std::string tempDir,
+                               std::string jsonDir)
     : openPoseExePath(std::move(openPosePath)),
       tempImageDir(std::move(tempDir)),
       outputJsonDir(std::move(jsonDir)),
       netResolution(368),
       useMaximumAccuracy(false),
-      keypointConfidenceThreshold(30) {
+      keypointConfidenceThreshold(30),
+      batchSize(20),
+      m_pCoordinateMapper(nullptr) {
 
     // Create required directories if they don't exist
     if (!fs::exists(tempImageDir)) {
@@ -33,10 +35,26 @@ OpenPoseCapture::OpenPoseCapture(std::string  openPosePath,
 }
 
 OpenPoseCapture::~OpenPoseCapture() {
+    // Stop any processing
+    if (isProcessing) {
+        isProcessing = false;
+        jobCV.notify_all();
+
+        for (auto& thread : workerThreads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+
     // Clean up temp directories
     try {
         if (fs::exists(tempImageDir)) {
             fs::remove_all(tempImageDir);
+        }
+
+        if (fs::exists(outputJsonDir)) {
+            fs::remove_all(outputJsonDir);
         }
     } catch (const std::exception& e) {
         spdlog::warn("Failed to clean up temp directory: {}", e.what());
@@ -113,7 +131,7 @@ bool OpenPoseCapture::runOpenPoseOnImage(const std::string& imagePath, const std
         cmd << " --net_resolution -1x" << netResolution;
     }
 
-    spdlog::info("Running OpenPose command: {}", cmd.str());
+    spdlog::debug("Running OpenPose command: {}", cmd.str());
 
     // Execute command
     int result = std::system(cmd.str().c_str());
@@ -164,32 +182,183 @@ std::string OpenPoseCapture::getLastJsonFile(const std::string& directory) {
     return latestFile;
 }
 
+cv::Mat OpenPoseCapture::loadRawDepthData(const std::string& depthPath) {
+    std::ifstream depthFile(depthPath, std::ios::binary);
+    if (!depthFile.is_open()) {
+        spdlog::error("Failed to open depth file: {}", depthPath);
+        return cv::Mat();
+    }
+
+    // Read dimensions
+    int rows, cols;
+    depthFile.read(reinterpret_cast<char*>(&rows), sizeof(int));
+    depthFile.read(reinterpret_cast<char*>(&cols), sizeof(int));
+
+    // Allocate matrix
+    cv::Mat depthImg(rows, cols, CV_16UC1);
+
+    // Read data
+    depthFile.read(reinterpret_cast<char*>(depthImg.data),
+                  depthImg.total() * depthImg.elemSize());
+    depthFile.close();
+
+    return depthImg;
+}
+
+bool OpenPoseCapture::process3DLifting(const cv::Mat& colorImage,
+                                     const cv::Mat& depthImage,
+                                     ICoordinateMapper* coordinateMapper,
+                                     const json& openposeData,
+                                     std::vector<Person3D>& detectedPeople) const {
+    if (colorImage.empty() || depthImage.empty() || !coordinateMapper || openposeData.empty()) {
+        spdlog::error("Invalid inputs to process3DLifting");
+        return false;
+    }
+
+    // Ensure depth image is 16-bit
+    cv::Mat depthMat16U;
+    if (depthImage.type() != CV_16UC1) {
+        depthImage.convertTo(depthMat16U, CV_16UC1, 65535.0/255.0);
+    } else {
+        depthMat16U = depthImage;
+    }
+
+    // Pre-map the entire color frame to depth space for efficiency
+    const int depthWidth = depthImage.cols;
+    const int depthHeight = depthImage.rows;
+    const int depthSize = depthWidth * depthHeight;
+
+    // Create depth to camera mapping table
+    std::vector<DepthSpacePoint> colorToDepthMap(colorImage.cols * colorImage.rows);
+
+    // Get depth frame data
+    std::vector<UINT16> depthData(depthSize);
+    for (int y = 0; y < depthHeight; y++) {
+        for (int x = 0; x < depthWidth; x++) {
+            depthData[y * depthWidth + x] = depthMat16U.at<UINT16>(y, x);
+        }
+    }
+
+    // Map color frame to depth space
+    HRESULT hr = coordinateMapper->MapColorFrameToDepthSpace(
+        depthSize,
+        depthData.data(),
+        colorToDepthMap.size(),
+        colorToDepthMap.data());
+
+    if (FAILED(hr)) {
+        spdlog::error("Failed to map color frame to depth space");
+        return false;
+    }
+
+    // Process each detected person
+    detectedPeople.clear();
+
+    if (!openposeData.contains("people") || openposeData["people"].empty()) {
+        return false;
+    }
+
+    for (const auto& person : openposeData["people"]) {
+        Person3D person3D;
+
+        // Get 2D keypoints from OpenPose
+        if (!person.contains("pose_keypoints_2d") || person["pose_keypoints_2d"].empty()) {
+            continue;
+        }
+
+        const auto& keypoints2d = person["pose_keypoints_2d"];
+
+        // Process each keypoint
+        for (size_t i = 0; i < keypoints2d.size() / 3; i++) {
+            float x = keypoints2d[i*3];
+            float y = keypoints2d[i*3 + 1];
+            float confidence = keypoints2d[i*3 + 2];
+
+            // Skip low confidence points
+            if (confidence < keypointConfidenceThreshold / 100.0f) {
+                Keypoint3D kp = {0, 0, 0, 0};
+                person3D.keypoints.push_back(kp);
+                continue;
+            }
+
+            // Initialize keypoint with original 2D coordinates
+            Keypoint3D kp = {x, y, 0, confidence};
+
+            // Check if point is within color image bounds
+            if (x >= 0 && x < colorImage.cols && y >= 0 && y < colorImage.rows) {
+                // Get corresponding depth point from pre-calculated mapping
+                int colorIndex = static_cast<int>(y) * colorImage.cols + static_cast<int>(x);
+
+                if (colorIndex >= 0 && colorIndex < colorToDepthMap.size()) {
+                    DepthSpacePoint depthPoint = colorToDepthMap[colorIndex];
+
+                    // Check if mapping is valid
+                    if (depthPoint.X >= 0 && depthPoint.Y >= 0) {
+                        int depthX = static_cast<int>(depthPoint.X);
+                        int depthY = static_cast<int>(depthPoint.Y);
+
+                        // Check if within depth image bounds
+                        if (depthX >= 0 && depthX < depthMat16U.cols &&
+                            depthY >= 0 && depthY < depthMat16U.rows) {
+
+                            // Get depth value at this point
+                            UINT16 depth = depthMat16U.at<UINT16>(depthY, depthX);
+
+                            // Only process valid depth values
+                            if (depth > 0) {
+                                // Convert to camera space
+                                CameraSpacePoint cameraPoint;
+                                hr = coordinateMapper->MapDepthPointToCameraSpace(
+                                    depthPoint, depth, &cameraPoint);
+
+                                if (SUCCEEDED(hr)) {
+                                    // Update with 3D coordinates
+                                    kp.x = cameraPoint.X;
+                                    kp.y = cameraPoint.Y;
+                                    kp.z = cameraPoint.Z;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Add keypoint
+            person3D.keypoints.push_back(kp);
+        }
+
+        // Add person if they have keypoints
+        if (!person3D.keypoints.empty()) {
+            detectedPeople.push_back(person3D);
+        }
+    }
+
+    return !detectedPeople.empty();
+}
+
 bool OpenPoseCapture::processFrame(const cv::Mat& colorImage, const cv::Mat& depthImage,
-                                 ICoordinateMapper* coordinateMapper, // Removed const
+                                 ICoordinateMapper* coordinateMapper,
                                  std::vector<Person3D>& detectedPeople) const {
     if (colorImage.empty() || depthImage.empty() || !coordinateMapper) {
         spdlog::error("Invalid inputs to processFrame");
         return false;
     }
 
-    // Convert depth image to proper format if needed
-    cv::Mat depthMat16U;
-    if (depthImage.type() != CV_16UC1) {
-        spdlog::info("Converting depth image from type {} to CV_16UC1", depthImage.type());
-        // If our depth image is 8-bit (visualization), we need the original data
-        // This is just a fallback - you should pass the original 16-bit depth data
-        depthImage.convertTo(depthMat16U, CV_16UC1, 65535.0/255.0);
-    } else {
-        depthMat16U = depthImage;
+    // Create a unique timestamp for this frame
+    auto timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+    std::string imagePath = tempImageDir + "/frame_" + std::to_string(timestamp) + ".png";
+
+    // Ensure temp directory exists
+    if (!fs::exists(tempImageDir)) {
+        fs::create_directories(tempImageDir);
     }
 
     // Save the color image to temp directory
-    auto timestamp = std::chrono::system_clock::now().time_since_epoch().count();
-    std::string imagePath = tempImageDir + "/frame_" + std::to_string(timestamp) + ".png";
     cv::imwrite(imagePath, colorImage);
 
     // Run OpenPose on the image
     if (!runOpenPoseOnImage(tempImageDir, outputJsonDir)) {
+        fs::remove(imagePath);
         return false;
     }
 
@@ -197,18 +366,23 @@ bool OpenPoseCapture::processFrame(const cv::Mat& colorImage, const cv::Mat& dep
     std::string jsonFile = getLastJsonFile(outputJsonDir);
     if (jsonFile.empty()) {
         spdlog::error("No JSON output found from OpenPose");
+        fs::remove(imagePath);
         return false;
     }
 
     // Read and parse the JSON
     json openposeData = readOpenPoseJson(jsonFile);
+
+    // Clean up temp files
+    fs::remove(imagePath);
+    fs::remove(jsonFile);
+
     if (openposeData.empty() || !openposeData.contains("people")) {
         spdlog::warn("No people detected in the frame");
         return false;
     }
 
     // Pre-map the entire color frame to depth space for efficiency
-    // This is better than trying to map individual points
     const int depthWidth = depthImage.cols;
     const int depthHeight = depthImage.rows;
     const int depthSize = depthWidth * depthHeight;
@@ -278,7 +452,7 @@ bool OpenPoseCapture::processFrame(const cv::Mat& colorImage, const cv::Mat& dep
                         int depthY = static_cast<int>(depthPoint.Y);
 
                         // Check if within depth image bounds
-                        if (depthX >= 0 && depthX < depthMat16U.cols && depthY >= 0 && depthY < depthMat16U.rows) {
+                        if (depthX >= 0 && depthX < depthImage.cols && depthY >= 0 && depthY < depthImage.rows) {
                             // Get depth value at this point
                             UINT16 depth = depthImage.at<UINT16>(depthY, depthX);
 
@@ -312,6 +486,310 @@ bool OpenPoseCapture::processFrame(const cv::Mat& colorImage, const cv::Mat& dep
     }
 
     return !detectedPeople.empty();
+}
+
+bool OpenPoseCapture::processBatch(const std::vector<std::string>& colorImagePaths,
+                                 const std::vector<std::string>& depthRawPaths,
+                                 ICoordinateMapper* coordinateMapper,
+                                 const std::string& outputDir) const {
+    if (colorImagePaths.empty() || colorImagePaths.size() != depthRawPaths.size()) {
+        spdlog::error("Invalid batch input");
+        return false;
+    }
+
+    // Create output directory
+    fs::create_directories(outputDir);
+    fs::create_directories(outputDir + "/json");
+    fs::create_directories(outputDir + "/viz");
+
+    // Create a unique batch directory
+    auto timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+    std::string batchTempDir = tempImageDir + "/batch_" + std::to_string(timestamp);
+    fs::create_directories(batchTempDir);
+
+    // Copy all images to temp dir for batch processing
+    for (size_t i = 0; i < colorImagePaths.size(); i++) {
+        // Get the frame index from the filename
+        std::string filename = fs::path(colorImagePaths[i]).filename().string();
+        fs::copy_file(colorImagePaths[i],
+                     batchTempDir + "/" + filename,
+                     fs::copy_options::overwrite_existing);
+    }
+
+    // Run OpenPose on the batch
+    std::string batchJsonDir = outputJsonDir + "/batch_" + std::to_string(timestamp);
+    fs::create_directories(batchJsonDir);
+    if (!runOpenPoseOnImage(batchTempDir, batchJsonDir)) {
+        fs::remove_all(batchTempDir);
+        return false;
+    }
+
+    // Process each result
+    for (size_t i = 0; i < colorImagePaths.size(); i++) {
+        // Extract frame index from filename
+        std::string filename = fs::path(colorImagePaths[i]).filename().string();
+        std::string baseFilename = fs::path(filename).stem().string();
+
+        // Find corresponding JSON file - OpenPose adds '_keypoints' to the filename
+        std::string jsonFile = batchJsonDir + "/" + baseFilename + "_keypoints.json";
+        if (!fs::exists(jsonFile)) {
+            spdlog::warn("No JSON result for frame {}", baseFilename);
+            continue;
+        }
+
+        // Load depth data
+        cv::Mat depthImg = loadRawDepthData(depthRawPaths[i]);
+        if (depthImg.empty()) {
+            continue;
+        }
+
+        // Load color image
+        cv::Mat colorImg = cv::imread(colorImagePaths[i]);
+        if (colorImg.empty()) {
+            continue;
+        }
+
+        // Process the frame with 3D lifting
+        std::vector<Person3D> people;
+        json openposeData = readOpenPoseJson(jsonFile);
+
+        if (process3DLifting(colorImg, depthImg, coordinateMapper, openposeData, people)) {
+            // Extract frame index from filename (assuming format frame_X.png)
+            size_t underscore = baseFilename.find('_');
+            std::string frameIndexStr = (underscore != std::string::npos) ?
+                                       baseFilename.substr(underscore + 1) : baseFilename;
+
+            // Save the 3D result
+            std::string outJsonPath = outputDir + "/json/frame_" + frameIndexStr + ".json";
+            save3DSkeletonToJson(people, outJsonPath);
+
+            // Create visualization
+            cv::Mat visualImg = colorImg.clone();
+            visualize3DSkeleton(visualImg, people);
+
+            std::string visualPath = outputDir + "/viz/frame_" + frameIndexStr + ".png";
+            cv::imwrite(visualPath, visualImg);
+        }
+    }
+
+    // Clean up temp directories
+    fs::remove_all(batchTempDir);
+    fs::remove_all(batchJsonDir);
+
+    return true;
+}
+
+void OpenPoseCapture::processingWorker(const std::string& outputDir) {
+    while (true) {
+        ProcessingJob job;
+        bool hasJob = false;
+
+        // Get a job from the queue
+        {
+            std::unique_lock<std::mutex> lock(jobMutex);
+            if (!jobQueue.empty()) {
+                job = jobQueue.front();
+                jobQueue.pop();
+                hasJob = true;
+            } else if (!isProcessing) {
+                // No more jobs and processing has stopped
+                break;
+            } else {
+                // Wait for more jobs
+                jobCV.wait(lock);
+                continue;
+            }
+        }
+
+        if (hasJob) {
+            try {
+                // Load depth data
+                cv::Mat depthImg = loadRawDepthData(job.depthPath);
+                if (depthImg.empty()) {
+                    spdlog::error("Failed to load depth data for frame {}", job.frameIndex);
+                    ++jobsCompleted;
+                    continue;
+                }
+
+                // Load color image
+                cv::Mat colorImg = cv::imread(job.colorPath);
+                if (colorImg.empty()) {
+                    spdlog::error("Failed to load color image for frame {}", job.frameIndex);
+                    ++jobsCompleted;
+                    continue;
+                }
+
+                // Process the frame
+                std::vector<Person3D> people;
+                {
+                    std::lock_guard<std::mutex> lock(coordinateMapperMutex);
+                    if (!processFrame(colorImg, depthImg, m_pCoordinateMapper, people)) {
+                        spdlog::warn("No people detected in frame {}", job.frameIndex);
+                        ++jobsCompleted;
+                        continue;
+                    }
+                }
+
+                // Save the 3D result
+                std::string outJsonPath = outputDir + "/json/frame_" + std::to_string(job.frameIndex) + ".json";
+                save3DSkeletonToJson(people, outJsonPath);
+
+                // Create visualization
+                cv::Mat visualImg = colorImg.clone();
+                visualize3DSkeleton(visualImg, people);
+
+                std::string visualPath = outputDir + "/viz/frame_" + std::to_string(job.frameIndex) + ".png";
+                cv::imwrite(visualPath, visualImg);
+
+                ++jobsCompleted;
+
+                // Log progress
+                if (jobsCompleted % 10 == 0 || jobsCompleted == totalJobs) {
+                    spdlog::info("Processed {}/{} frames", jobsCompleted.load(), totalJobs.load());
+                }
+            } catch (const std::exception& e) {
+                spdlog::error("Error processing frame {}: {}", job.frameIndex, e.what());
+                ++jobsCompleted;
+            }
+        }
+    }
+}
+
+bool OpenPoseCapture::processRecordingDirectory(const std::string& recordingDir,
+                                             ICoordinateMapper* coordinateMapper,
+                                             const std::string& outputDir,
+                                             int numThreads) {
+    if (!fs::exists(recordingDir)) {
+        spdlog::error("Recording directory does not exist: {}", recordingDir);
+        return false;
+    }
+
+    if (!coordinateMapper) {
+        spdlog::error("Coordinate mapper is null");
+        return false;
+    }
+
+    // Store coordinate mapper for threads to use
+    m_pCoordinateMapper = coordinateMapper;
+
+    // Create output directories
+    fs::create_directories(outputDir);
+    fs::create_directories(outputDir + "/json");
+    fs::create_directories(outputDir + "/viz");
+
+    // Check if we have a video file or a directory of images
+    bool hasVideoFile = fs::exists(recordingDir + "/color.mp4");
+    bool hasColorDir = fs::exists(recordingDir + "/color");
+    bool hasProcessList = fs::exists(recordingDir + "/process_frames.txt");
+
+    // Get list of frames to process
+    std::vector<int> framesToProcess;
+    if (hasProcessList) {
+        // Load from the process_frames.txt file
+        std::ifstream indexFile(recordingDir + "/process_frames.txt");
+        int frameIdx;
+        while (indexFile >> frameIdx) {
+            framesToProcess.push_back(frameIdx);
+        }
+        spdlog::info("Found {} frames to process from index file", framesToProcess.size());
+    } else {
+        // Just count depth files
+        for (const auto& entry : fs::directory_iterator(recordingDir + "/depth_raw")) {
+            if (entry.path().extension() == ".bin") {
+                std::string filename = entry.path().filename().string();
+                // Extract frame number from format "frame_X.bin"
+                size_t underscore = filename.find('_');
+                size_t dot = filename.find('.');
+                if (underscore != std::string::npos && dot != std::string::npos) {
+                    int frameIdx = std::stoi(filename.substr(underscore + 1, dot - underscore - 1));
+                    framesToProcess.push_back(frameIdx);
+                }
+            }
+        }
+        std::ranges::sort(framesToProcess);
+        spdlog::info("Found {} depth frame files", framesToProcess.size());
+    }
+
+    if (framesToProcess.empty()) {
+        spdlog::error("No frames found to process");
+        return false;
+    }
+
+    // Open video capture if using video format
+    cv::VideoCapture videoCapture;
+    if (hasVideoFile) {
+        videoCapture.open(recordingDir + "/color.mp4");
+        if (!videoCapture.isOpened()) {
+            spdlog::error("Failed to open color video file");
+            return false;
+        }
+    }
+
+    // Set up multi-threading
+    int actualThreads = std::min(numThreads, static_cast<int>(std::thread::hardware_concurrency()));
+    if (actualThreads < 1) actualThreads = 1;
+
+    spdlog::info("Processing {} frames using {} threads", framesToProcess.size(), actualThreads);
+
+    // Initialize worker threads
+    isProcessing = true;
+    totalJobs = framesToProcess.size();
+    jobsCompleted = 0;
+
+    for (int i = 0; i < actualThreads; i++) {
+        workerThreads.emplace_back(&OpenPoseCapture::processingWorker, this, outputDir);
+    }
+
+    // Add jobs to the queue
+    for (int frameIdx : framesToProcess) {
+        ProcessingJob job;
+        job.frameIndex = frameIdx;
+        job.depthPath = recordingDir + "/depth_raw/frame_" + std::to_string(frameIdx) + ".bin";
+
+        if (hasVideoFile) {
+            // Create a temporary file from the video frame
+            std::string tempColorPath = tempImageDir + "/video_frame_" + std::to_string(frameIdx) + ".png";
+            videoCapture.set(cv::CAP_PROP_POS_FRAMES, frameIdx);
+
+            cv::Mat frame;
+            if (videoCapture.read(frame)) {
+                cv::imwrite(tempColorPath, frame);
+                job.colorPath = tempColorPath;
+            } else {
+                spdlog::error("Failed to read frame {} from video", frameIdx);
+                continue;
+            }
+        } else {
+            job.colorPath = recordingDir + "/color/frame_" + std::to_string(frameIdx) + ".png";
+        }
+
+        // Add to queue
+        {
+            std::unique_lock<std::mutex> lock(jobMutex);
+            jobQueue.push(job);
+        }
+        jobCV.notify_one();
+    }
+
+    // Signal completion
+    isProcessing = false;
+    jobCV.notify_all();
+
+    // Wait for all threads to finish
+    for (auto& thread : workerThreads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    // Clean up
+    workerThreads.clear();
+    if (hasVideoFile) {
+        videoCapture.release();
+    }
+
+    spdlog::info("Completed processing all frames");
+    return true;
 }
 
 bool OpenPoseCapture::save3DSkeletonToJson(const std::vector<Person3D>& people, const std::string& outputPath) {
@@ -350,30 +828,37 @@ void OpenPoseCapture::visualize3DSkeleton(cv::Mat& image, const std::vector<Pers
         {6, 7}, {8, 9}, {8, 12}, {9, 10}, {10, 11}, {12, 13}, {13, 14}
     };
 
-    for (const auto&[keypoints] : people) {
+    for (const auto& person : people) {
+        const auto& keypoints = person.keypoints;
+
         // Draw keypoints
-        for (auto [x, y, z, confidence] : keypoints) {
+        for (size_t i = 0; i < keypoints.size(); i++) {
+            const auto& kp = keypoints[i];
+
             // Skip invalid points
-            if (confidence < 0.1f) continue;
+            if (kp.confidence < 0.1f) continue;
 
             // Draw the keypoint - the z value affects the color (red to blue)
             // Normalize z between 0 and 1 for visualization
-            float normalizedZ = z;
+            float normalizedZ = kp.z;
             if (normalizedZ > 5.0f) normalizedZ = 5.0f;
             normalizedZ = normalizedZ / 5.0f;
 
             cv::Scalar color(255 * normalizedZ, 0, 255 * (1.0f - normalizedZ));
-            cv::circle(image, cv::Point(x, y), 5, color, -1);
+            cv::circle(image, cv::Point(kp.x, kp.y), 5, color, -1);
 
             // Draw depth value
             std::stringstream ss;
-            ss << std::fixed << std::setprecision(2) << z << "m";
-            cv::putText(image, ss.str(), cv::Point(x + 10, y),
+            ss << std::fixed << std::setprecision(2) << kp.z << "m";
+            cv::putText(image, ss.str(), cv::Point(kp.x + 10, kp.y),
                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
         }
 
         // Draw connections
-        for (const auto& [start, end] : connections) {
+        for (const auto& connection : connections) {
+            int start = connection.first;
+            int end = connection.second;
+
             if (start >= keypoints.size() || end >= keypoints.size()) {
                 continue;
             }

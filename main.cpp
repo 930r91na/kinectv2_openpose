@@ -1,179 +1,278 @@
 #include "KinectDepthChecker.h"
+#include "FrameRecorder.h"
 #include "OpenPoseCapture.h"
+#include "ConfigManager.h"
 #include <iostream>
 #include <filesystem>
 #include <spdlog/spdlog.h>
 
 namespace fs = std::filesystem;
 
-int main() {
+void displayHelp() {
+    std::cout << "KinectV2 OpenPose Integrator" << std::endl;
+    std::cout << "----------------------------" << std::endl;
+    std::cout << "Commands:" << std::endl;
+    std::cout << "  --record [name]    Record mode (default)" << std::endl;
+    std::cout << "  --process [name]   Process a recording" << std::endl;
+    std::cout << "  --interval N       Process every Nth frame (default: 1)" << std::endl;
+    std::cout << "  --threads N        Use N threads for processing (default: 4)" << std::endl;
+    std::cout << "  --compress         Use video compression for color frames" << std::endl;
+    std::cout << "  --config file.ini  Use specific config file (default: config.ini)" << std::endl;
+    std::cout << "  --help             Display this help" << std::endl;
+}
+
+int main(int argc, char** argv) {
     // Configure logging
     spdlog::set_level(spdlog::level::info);
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
 
-    // Disable OpenCV logging
-    cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_ERROR);
+    // Parse command line arguments
+    bool isRecordMode = true;
+    std::string recordingName = "recording";
+    std::string configFile = "config.ini";
+    int processingInterval = 1;
+    int numThreads = 4;
+    bool useCompression = false;
 
-    try {
-        // Initialize COM for Kinect
-        if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
-            spdlog::error("Failed to initialize COM");
-            return -1;
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--process") {
+            isRecordMode = false;
+        } else if (arg == "--record") {
+            isRecordMode = true;
+        } else if ((arg == "--name" || arg == "--record" || arg == "--process") && i+1 < argc) {
+            recordingName = argv[i+1];
+            i++;
+        } else if (arg == "--interval" && i+1 < argc) {
+            processingInterval = std::stoi(argv[i+1]);
+            i++;
+        } else if (arg == "--threads" && i+1 < argc) {
+            numThreads = std::stoi(argv[i+1]);
+            i++;
+        } else if (arg == "--compress") {
+            useCompression = true;
+        } else if (arg == "--config" && i+1 < argc) {
+            configFile = argv[i+1];
+            i++;
+        } else if (arg == "--help") {
+            displayHelp();
+            return 0;
         }
+    }
 
-        spdlog::info("Kinect V2 + OpenPose 3D Skeleton Capture");
-        spdlog::info("----------------------------------------");
+    // Load configuration
+    ConfigManager config(configFile);
+    std::string openPosePath = config.get<std::string>("openpose_path",
+        "C:\\Users\\koqui\\OpenPose\\openpose\\bin\\OpenPoseDemo.exe");
+    int netResolution = config.get<int>("net_resolution", 368);
+    bool useMaximumAccuracy = config.get<bool>("use_maximum_accuracy", false);
+    int confidenceThreshold = config.get<int>("keypoint_confidence_threshold", 40);
+    int frameInterval = config.get<int>("process_every_n_frames", processingInterval);
 
-        // Create output directory for 3D data
-        std::string outputDir = "output_3d";
-        if (!fs::exists(outputDir)) {
-            fs::create_directory(outputDir);
-        }
+    // Override config with command line if specified
+    if (processingInterval != 1) {
+        frameInterval = processingInterval;
+    }
 
-        // Initialize Kinect
-        KinectDepthChecker kinect;
-
-        bool init = kinect.initialize();
-        spdlog::info("Waiting for Kinect to fully initialize...");
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-
-        if (!init) {
-            spdlog::error("Failed to initialize Kinect");
-            CoUninitialize();
-            return -1;
-        }
-
-        // Check Kinect FPS
-        kinect.checkDepthFPS(3);
-
-        // Initialize OpenPose with path to executable
-        // Update this path to match your OpenPose installation
-        OpenPoseCapture openpose("C:\\Users\\koqui\\OpenPose\\openpose\\bin\\OpenPoseDemo.exe");
-
-        // Configure OpenPose settings
-        openpose.setNetResolution(368);       // Default balanced resolution
-        openpose.setMaximumAccuracy(false);   // Set to true for maximum accuracy (slower)
-        openpose.setKeypointConfidenceThreshold(40); // 40% confidence threshold
-
-        if (!openpose.initialize()) {
-            spdlog::error("Failed to initialize OpenPose");
-            CoUninitialize();
-            return -1;
-        }
-
-        // Processing parameters
-        int frameCount = 0;
-        int processedFrames = 0;
-        int processingInterval = 15; // Process every 15th frame for performance
-        auto lastProcessTime = std::chrono::high_resolution_clock::now();
-
-        // Main processing loop
-        bool running = true;
-        spdlog::info("Starting main loop. Press:");
-        spdlog::info("  'q' to exit");
-        spdlog::info("  's' to save current frame as 3D skeleton");
-        spdlog::info("  'p' to process current frame with OpenPose");
-
-        while (running) {
-            // Update Kinect - gets new depth and color frames
-            kinect.update();
-            frameCount++;
-
-            // Get color and depth images
-            cv::Mat colorImg = kinect.getColorImage();
-            cv::Mat depthImg = kinect.getDepthImage();
-
-            // Skip processing if either image is empty
-            if (colorImg.empty() || depthImg.empty()) {
-                spdlog::warn("Empty frame detected, skipping frame {}", frameCount);
-                continue;
+    if (isRecordMode) {
+        // RECORDING MODE
+        try {
+            // Initialize COM for Kinect
+            if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+                spdlog::error("Failed to initialize COM");
+                return -1;
             }
 
-            // Process at regular intervals or when triggered
-            auto currentTime = std::chrono::high_resolution_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                currentTime - lastProcessTime).count();
+            spdlog::info("Kinect V2 Frame Recorder");
+            spdlog::info("----------------------");
 
-            // Check if it's time to process a frame
-            bool shouldProcessFrame = (frameCount % processingInterval == 0) && (elapsed > 500);
+            // Initialize Kinect
+            KinectDepthChecker kinect;
 
-            // Handle keyboard input
-            int key = cv::waitKey(1);
-            if (key == 'q' || key == 'Q') {
-                running = false;
-            } else if (key == 'p' || key == 'P') {
-                // Force processing on 'p' key
-                shouldProcessFrame = true;
-            } else if (key == 's' || key == 'S') {
-                // Save the current 3D skeleton on 's' key
-                shouldProcessFrame = true;
-                // We'll save the result below after processing
+            bool init = kinect.initialize();
+            spdlog::info("Waiting for Kinect to fully initialize...");
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+
+            if (!init) {
+                spdlog::error("Failed to initialize Kinect");
+                CoUninitialize();
+                return -1;
             }
 
-            // Process frame if needed
-            if (shouldProcessFrame) {
-                spdlog::info("Processing frame {} with OpenPose", frameCount);
-                std::vector<Person3D> people3D;
+            // Initialize recorder
+            std::string outputDir = "recordings/" + recordingName;
+            FrameRecorder recorder(outputDir);
 
-                // Process the frame with OpenPose and get 3D data
-                if (openpose.processFrame(colorImg, depthImg, kinect.getCoordinateMapper(), people3D)) {
-                    processedFrames++;
-                    lastProcessTime = currentTime;
+            // Set recorder options
+            recorder.setProcessingInterval(frameInterval);
+            recorder.setUseVideoCompression(useCompression);
 
-                    // Log the detected people and keypoints
-                    spdlog::info("Detected {} people in the frame", people3D.size());
+            // Set up UI
+            cv::namedWindow("Color Feed", cv::WINDOW_NORMAL);
+            cv::namedWindow("Depth Feed", cv::WINDOW_NORMAL);
 
-                    // For each person, log some of their 3D keypoints
-                    for (size_t personIdx = 0; personIdx < people3D.size(); personIdx++) {
-                        const auto& person = people3D[personIdx];
-                        spdlog::info("Person {}: {} keypoints", personIdx, person.keypoints.size());
+            // Main loop
+            bool running = true;
+            bool isRecording = false;
+            int frameCount = 0;
 
-                        // Log a few key joints with their 3D coordinates
-                        const std::vector<std::pair<int, std::string>> keyJoints = {
-                            {0, "Nose"}, {1, "Neck"}, {8, "MidHip"},
-                            {4, "RWrist"}, {7, "LWrist"}
-                        };
+            spdlog::info("Ready to record. Controls:");
+            spdlog::info("  'r' - Start/stop recording");
+            spdlog::info("  's' - Save the recording");
+            spdlog::info("  'q' - Quit");
 
-                        for (const auto& [idx, name] : keyJoints) {
-                            if (idx < person.keypoints.size()) {
-                                const auto& kp = person.keypoints[idx];
-                                spdlog::info("  Joint {}: ({:.3f}, {:.3f}, {:.3f}m) conf: {:.2f}",
-                                             name, kp.x, kp.y, kp.z, kp.confidence);
-                            }
-                        }
+            auto lastFpsTime = std::chrono::high_resolution_clock::now();
+            int displayFps = 0;
 
-                        // Visualize the 3D skeleton
-                        cv::Mat visualImg = colorImg.clone();
-                        openpose.visualize3DSkeleton(visualImg, people3D);
+            while (running) {
+                // Update Kinect data
+                kinect.update();
+                frameCount++;
 
-                        // Resize for display if needed
-                        cv::Mat displayImg;
-                        cv::resize(visualImg, displayImg, cv::Size(), 0.5, 0.5);
-                        cv::imshow("3D Skeleton", displayImg);
+                // Get images
+                cv::Mat colorImg = kinect.getColorImage();
+                cv::Mat depthImg = kinect.getDepthImage();
+                cv::Mat depthViz;
 
-                        // Save if 's' was pressed
-                        if (key == 's' || key == 'S') {
-                            std::string outputPath = outputDir + "/skeleton3d_" +
-                                                  std::to_string(frameCount) + ".json";
-                            if (openpose.save3DSkeletonToJson(people3D, outputPath)) {
-                                spdlog::info("Saved 3D skeleton to {}", outputPath);
-                            }
-                        }
+                // Skip if frames are empty
+                if (colorImg.empty() || depthImg.empty()) {
+                    spdlog::warn("Empty frame detected");
+                    continue;
+                }
+
+                // Add frame to recorder if recording
+                if (isRecording) {
+                    recorder.addFrame(colorImg, depthImg);
+                }
+
+                // Create visualization of the depth image
+                cv::normalize(depthImg, depthViz, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+                cv::applyColorMap(depthViz, depthViz, cv::COLORMAP_JET);
+
+                // Add recording indicator
+                if (isRecording) {
+                    cv::putText(colorImg, "RECORDING", cv::Point(30, 30),
+                               cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
+                    cv::circle(colorImg, cv::Point(20, 20), 10, cv::Scalar(0, 0, 255), -1);
+                }
+
+                // Calculate FPS
+                auto currentTime = std::chrono::high_resolution_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastFpsTime);
+
+                if (elapsed.count() >= 1) {
+                    displayFps = frameCount;
+                    frameCount = 0;
+                    lastFpsTime = currentTime;
+                }
+
+                // Display FPS
+                cv::putText(colorImg, "FPS: " + std::to_string(displayFps),
+                           cv::Point(colorImg.cols - 150, 30), cv::FONT_HERSHEY_SIMPLEX,
+                           1, cv::Scalar(255, 255, 255), 2);
+
+                // Display images
+                cv::resize(colorImg, colorImg, cv::Size(), 0.5, 0.5);
+                cv::imshow("Color Feed", colorImg);
+                cv::imshow("Depth Feed", depthViz);
+
+                // Handle keyboard input
+                int key = cv::waitKey(1);
+
+                if (key == 'q' || key == 'Q') {
+                    running = false;
+                } else if (key == 'r' || key == 'R') {
+                    if (isRecording) {
+                        recorder.stopRecording();
+                        isRecording = false;
+                        spdlog::info("Recording stopped");
+                    } else {
+                        recorder.startRecording();
+                        isRecording = true;
+                        spdlog::info("Recording started");
                     }
-                } else {
-                    spdlog::warn("No people detected or processing failed");
+                } else if (key == 's' || key == 'S') {
+                    if (isRecording) {
+                        recorder.stopRecording();
+                        isRecording = false;
+                    }
+
+                    spdlog::info("Saving frames to disk...");
+                    recorder.saveFramesToDisk();
+                    spdlog::info("Recorded {} frames", recorder.getFrameCount());
                 }
             }
+
+            // Clean up
+            if (isRecording) {
+                recorder.stopRecording();
+            }
+
+            CoUninitialize();
+
+        } catch (const std::exception& e) {
+            spdlog::error("Unhandled exception: {}", e.what());
+            return -1;
+        }
+    } else {
+        // PROCESSING MODE
+        spdlog::info("Processing recorded frames");
+
+        std::string recordingDir = "recordings/" + recordingName;
+        if (!fs::exists(recordingDir)) {
+            spdlog::error("Recording directory not found: {}", recordingDir);
+            return -1;
         }
 
-        CoUninitialize();
-        spdlog::info("Processed {} frames out of {} total frames", processedFrames, frameCount);
-        spdlog::info("Average processing rate: {:.2f}%",
-                     (processedFrames > 0) ? (100.0f * processedFrames / frameCount) : 0.0f);
-    }
-    catch (const std::exception& e) {
-        spdlog::error("Unhandled exception: {}", e.what());
-        return -1;
+        std::string outputDir = "processed/" + recordingName;
+
+        try {
+            // Initialize COM for Kinect
+            if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+                spdlog::error("Failed to initialize COM");
+                return -1;
+            }
+
+            // Initialize Kinect to get coordinate mapper
+            KinectDepthChecker kinect;
+            if (!kinect.initialize()) {
+                spdlog::error("Failed to initialize Kinect");
+                CoUninitialize();
+                return -1;
+            }
+
+            // Initialize OpenPose
+            OpenPoseCapture openpose(openPosePath);
+            openpose.setNetResolution(netResolution);
+            openpose.setMaximumAccuracy(useMaximumAccuracy);
+            openpose.setKeypointConfidenceThreshold(confidenceThreshold);
+
+            if (!openpose.initialize()) {
+                spdlog::error("Failed to initialize OpenPose");
+                CoUninitialize();
+                return -1;
+            }
+
+            // Process recording using multi-threading
+            bool success = openpose.processRecordingDirectory(
+                recordingDir,
+                kinect.getCoordinateMapper(),
+                outputDir,
+                numThreads
+            );
+
+            if (success) {
+                spdlog::info("Successfully processed recording at {}", outputDir);
+            } else {
+                spdlog::error("Failed to process recording");
+            }
+
+            CoUninitialize();
+
+        } catch (const std::exception& e) {
+            spdlog::error("Unhandled exception during processing: {}", e.what());
+            return -1;
+        }
     }
 
     return 0;
