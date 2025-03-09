@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <chrono>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 
@@ -25,16 +26,30 @@ FrameRecorder::~FrameRecorder() {
     }
 }
 
+
 void FrameRecorder::startRecording() {
-    if (isRecording) return;
+    if (isRecording) {
+        spdlog::warn("Recording already in progress");
+        return;
+    }
+
+    // Make sure output directory exists
+    if (!fs::exists(outputDirectory)) {
+        fs::create_directories(outputDirectory);
+        spdlog::info("Created output directory: {}", outputDirectory);
+    }
 
     // Create a new recording directory with timestamp
     auto timestamp = std::chrono::system_clock::now().time_since_epoch().count();
-    currentRecordingPath = outputDirectory + "/recording_" + std::to_string(timestamp);
 
-    // Create subdirectories - ensure we use absolute paths for robustness
+    // Use the output directory as the base path
+    currentRecordingPath = outputDirectory;
+
+    // Create absolute path for robustness
     fs::path absolutePath = fs::absolute(currentRecordingPath);
     currentRecordingPath = absolutePath.string(); // Store absolute path
+
+    spdlog::info("Recording to directory: {}", currentRecordingPath);
 
     // Create all required directories
     fs::create_directories(currentRecordingPath);
@@ -59,26 +74,32 @@ void FrameRecorder::startRecording() {
     }
 
     metadataStream << "Recording started at: " << timestamp << std::endl;
+    metadataStream << "Output directory: " << currentRecordingPath << std::endl;
 
     // Initialize video writer for color frames if using compression
     if (useVideoCompression) {
         // Use H.264 codec (or another appropriate codec)
         int fourcc = cv::VideoWriter::fourcc('H', '2', '6', '4');
         std::string videoPath = currentRecordingPath + "/color.mp4";
-        colorVideoWriter.open(videoPath, fourcc, 30.0, cv::Size(1920, 1080));
+        colorVideoWriter.open(videoPath, fourcc, targetFps, cv::Size(1920, 1080));
 
         if (!colorVideoWriter.isOpened()) {
             spdlog::error("Failed to create video writer at {}, falling back to PNG frames", videoPath);
             useVideoCompression = false;
             fs::create_directories(currentRecordingPath + "/color");
+        } else {
+            spdlog::info("Created MP4 video writer with target FPS: {}", targetFps);
         }
     }
 
-    // Reset frame counter
+    // Reset frame counter and timestamps
     frameCounter = 0;
+    recordingStartTime = std::chrono::high_resolution_clock::now();
+    lastFrameTime = recordingStartTime;
 
     // Start processing thread
     isProcessing = true;
+    shouldWrite = true;
     if (writerThread.joinable()) {
         writerThread.join(); // Ensure any previous thread is properly joined
     }
@@ -114,7 +135,16 @@ void FrameRecorder::stopRecording() {
 
     // Close metadata file and write final count
     if (metadataStream.is_open()) {
+        auto recordingEndTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            recordingEndTime - recordingStartTime).count();
+
+        double actualFps = static_cast<double>(frameCounter) / (duration / 1000.0);
+
         metadataStream << "Total frames: " << frameCounter << std::endl;
+        metadataStream << "Recording duration (ms): " << duration << std::endl;
+        metadataStream << "Actual FPS: " << actualFps << std::endl;
+        metadataStream << "Target FPS: " << targetFps << std::endl;
         metadataStream.close();
     }
 
@@ -123,16 +153,54 @@ void FrameRecorder::stopRecording() {
         colorVideoWriter.release();
     }
 
+    // Save all the frame timestamps to a file for analysis
+    if (!frameTimestamps.empty()) {
+        std::ofstream timestampFile(currentRecordingPath + "/frame_timestamps.csv");
+        timestampFile << "frame_index,timestamp,elapsed_ms,delta_ms" << std::endl;
+
+        uint64_t startTs = frameTimestamps.front();
+        uint64_t prevTs = startTs;
+
+        for (size_t i = 0; i < frameTimestamps.size(); i++) {
+            uint64_t ts = frameTimestamps[i];
+            uint64_t elapsed = ts - startTs;
+            uint64_t delta = ts - prevTs;
+
+            timestampFile << i << "," << ts << "," << elapsed << "," << delta << std::endl;
+            prevTs = ts;
+        }
+
+        timestampFile.close();
+    }
+
     spdlog::info("Recording stopped. Captured {} frames", frameCounter);
 }
 
 void FrameRecorder::addFrame(const cv::Mat& colorImg, const cv::Mat& depthImg) {
     if (!isRecording) return;
 
+    // Calculate time since last frame for FPS throttling
+    auto currentTime = std::chrono::high_resolution_clock::now();
+    auto timeSinceLastFrame = std::chrono::duration_cast<std::chrono::milliseconds>(
+        currentTime - lastFrameTime).count();
+
+    // If we're trying to maintain a target FPS, throttle frame capture
+    if (frameLimitingEnabled && targetFps > 0) {
+        int minFrameInterval = 1000 / targetFps;
+        if (timeSinceLastFrame < minFrameInterval) {
+            // Skip this frame to maintain target FPS
+            return;
+        }
+    }
+
+    // Update last frame time
+    lastFrameTime = currentTime;
+
     FramePair framePair;
     framePair.colorImage = colorImg.clone();
     framePair.depthImage = depthImg.clone();
     framePair.timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+    frameTimestamps.push_back(framePair.timestamp);
 
     {
         std::unique_lock<std::mutex> lock(framesMutex);
@@ -157,6 +225,10 @@ void FrameRecorder::processFrameQueue() {
     int failedColorWrites = 0;
     int failedDepthWrites = 0;
     int processedFrames = 0;
+
+    // Create performance metrics
+    auto processingStartTime = std::chrono::high_resolution_clock::now();
+    int lastLoggedFrameCount = 0;
 
     while (isProcessing) {
         FramePair frame;
@@ -187,9 +259,6 @@ void FrameRecorder::processFrameQueue() {
                 int currentFrame = frameCounter.fetch_add(1);
                 processedFrames++;
 
-                // Process only every N frames to save storage/CPU
-                bool shouldProcessDepth = (currentFrame % processingInterval == 0);
-
                 // Always save color frame
                 if (useVideoCompression) {
                     if (colorVideoWriter.isOpened()) {
@@ -202,6 +271,11 @@ void FrameRecorder::processFrameQueue() {
                         } else {
                             cv::cvtColor(frame.colorImage, bgrImage, cv::COLOR_GRAY2BGR);
                         }
+
+                        // Add frame number overlay to the video
+                        cv::putText(bgrImage, "Frame: " + std::to_string(currentFrame),
+                                  cv::Point(30, 30), cv::FONT_HERSHEY_SIMPLEX, 1,
+                                  cv::Scalar(0, 255, 0), 2);
 
                         colorVideoWriter.write(bgrImage);
                     } else {
@@ -219,8 +293,6 @@ void FrameRecorder::processFrameQueue() {
                     }
                 }
 
-                // Save raw depth data for selected frames
-                if (shouldProcessDepth) {
                     // Make sure depth image is valid
                     if (!frame.depthImage.empty() && frame.depthImage.type() == CV_16UC1) {
                         std::string depthRawPath = currentRecordingPath + "/depth_raw/frame_" +
@@ -256,7 +328,7 @@ void FrameRecorder::processFrameQueue() {
                         failedDepthWrites++;
                         spdlog::warn("Invalid depth image for frame {}", currentFrame);
                     }
-                }
+
 
                 // Update metadata
                 if (metadataStream.is_open()) {
@@ -265,15 +337,19 @@ void FrameRecorder::processFrameQueue() {
 
                     metadataStream << "Frame: " << currentFrame <<
                                   " Timestamp: " << frame.timestamp;
-                    if (shouldProcessDepth) {
-                        metadataStream << " HasDepth: yes";
-                    }
                     metadataStream << std::endl;
                 }
 
-                // Log progress occasionally
-                if (processedFrames % 100 == 0) {
-                    spdlog::info("Processed {} frames", processedFrames);
+                // Log progress and metrics occasionally
+                if (processedFrames % 30 == 0 || processedFrames - lastLoggedFrameCount >= 30) {
+                    auto currentTime = std::chrono::high_resolution_clock::now();
+                    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        currentTime - processingStartTime).count();
+                    double fps = processedFrames * 1000.0 / elapsedMs;
+
+                    spdlog::info("Processed {} frames (writing at {:.1f} FPS)",
+                                processedFrames, fps);
+                    lastLoggedFrameCount = processedFrames;
                 }
             } catch (const std::exception& e) {
                 spdlog::error("Error processing frame: {}", e.what());
@@ -284,6 +360,18 @@ void FrameRecorder::processFrameQueue() {
     // Log completion statistics
     spdlog::info("Frame processor finished. Processed {} frames ({} color failures, {} depth failures)",
                 processedFrames, failedColorWrites, failedDepthWrites);
+}
+
+// Set the target FPS for recording
+void FrameRecorder::setTargetFPS(int fps) {
+    targetFps = fps;
+    spdlog::info("Set target recording FPS to {}", targetFps);
+}
+
+// Enable or disable frame limiting based on target FPS
+void FrameRecorder::setFrameLimiting(bool enabled) {
+    frameLimitingEnabled = enabled;
+    spdlog::info("Frame rate limiting set to: {}", enabled ? "enabled" : "disabled");
 }
 
 bool FrameRecorder::saveFramesToDisk() {
@@ -308,15 +396,28 @@ bool FrameRecorder::saveFramesToDisk() {
     }
 
     // Check if path is valid
-    if (currentRecordingPath.empty() || !fs::exists(currentRecordingPath)) {
-        spdlog::error("Recording path is invalid or doesn't exist: {}",
-                     currentRecordingPath.empty() ? "[empty]" : currentRecordingPath);
+    if (currentRecordingPath.empty()) {
+        spdlog::error("Recording path is empty. No recording has been started yet.");
+        return false;
+    }
+
+    if (!fs::exists(currentRecordingPath)) {
+        spdlog::error("Recording path does not exist: {}", currentRecordingPath);
         return false;
     }
 
     // Update metadata with final count if file is still open
     if (metadataStream.is_open()) {
+        auto recordingEndTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            recordingEndTime - recordingStartTime).count();
+
+        double actualFps = static_cast<double>(frameCounter) / (duration / 1000.0);
+
         metadataStream << "Total frames: " << frameCounter << std::endl;
+        metadataStream << "Recording duration (ms): " << duration << std::endl;
+        metadataStream << "Actual FPS: " << actualFps << std::endl;
+        metadataStream << "Target FPS: " << targetFps << std::endl;
         metadataStream.close();
     }
 
@@ -354,6 +455,21 @@ bool FrameRecorder::saveFramesToDisk() {
             summaryFile << "Depth frames: " << depthFrames << std::endl;
         }
 
+        // Calculate actual FPS from timestamps if available
+        if (frameTimestamps.size() >= 2) {
+            uint64_t startTime = frameTimestamps.front();
+            uint64_t endTime = frameTimestamps.back();
+            double durationSec = (endTime - startTime) / 1000000000.0; // Convert to seconds
+            double calculatedFps = frameTimestamps.size() / durationSec;
+
+            summaryFile << "Recording duration (sec): " << durationSec << std::endl;
+            summaryFile << "Calculated FPS: " << calculatedFps << std::endl;
+
+            // Also append to main log
+            spdlog::info("Calculated actual recording FPS: {:.2f} over {:.2f} seconds",
+                        calculatedFps, durationSec);
+        }
+
         summaryFile.close();
 
         // Update frame counter based on actual files if necessary
@@ -364,129 +480,112 @@ bool FrameRecorder::saveFramesToDisk() {
         spdlog::warn("Failed to create summary file: {}", e.what());
     }
 
-    spdlog::info("Frames saved to disk at {}", currentRecordingPath);
-    spdlog::info("Recorded {} frames", frameCounter);
-    return true;
-}
-
-bool FrameRecorder::loadRecordedFrames(const std::string& directory, std::vector<FramePair>& outFrames) {
-    if (!fs::exists(directory)) {
-        spdlog::error("Directory does not exist: {}", directory);
-        return false;
-    }
-
-    bool hasVideoFile = fs::exists(directory + "/color.mp4");
-    bool hasColorDir = fs::exists(directory + "/color");
-    bool hasDepthDir = fs::exists(directory + "/depth_raw");
-    bool hasProcessList = fs::exists(directory + "/process_frames.txt");
-
-    if ((!hasVideoFile && !hasColorDir) || !hasDepthDir) {
-        spdlog::error("Missing required directories in {}", directory);
-        return false;
-    }
-
-    outFrames.clear();
-
-    // Load frame indices to process
-    std::vector<int> framesToProcess;
-    if (hasProcessList) {
-        std::ifstream indexFile(directory + "/process_frames.txt");
-        int frameIdx;
-        while (indexFile >> frameIdx) {
-            framesToProcess.push_back(frameIdx);
+    // Create an MP4 from the PNG sequence if we didn't use video compression
+    if (!useVideoCompression && fs::exists(currentRecordingPath + "/color")) {
+    try {
+        // Count PNG files and determine framerate
+        std::vector<std::string> imageFiles;
+        for (const auto& entry : fs::directory_iterator(currentRecordingPath + "/color")) {
+            if (entry.path().extension() == ".png") {
+                imageFiles.push_back(entry.path().string());
+            }
         }
-        spdlog::info("Found {} frames to process from index file", framesToProcess.size());
-    } else {
-        // If no process list, count depth files
-        for (const auto& entry : fs::directory_iterator(directory + "/depth_raw")) {
-            if (entry.path().extension() == ".bin") {
-                std::string filename = entry.path().filename().string();
-                // Extract frame number from format "frame_X.bin"
-                size_t underscore = filename.find('_');
-                size_t dot = filename.find('.');
-                if (underscore != std::string::npos && dot != std::string::npos) {
-                    int frameIdx = std::stoi(filename.substr(underscore + 1, dot - underscore - 1));
-                    framesToProcess.push_back(frameIdx);
+
+        // Sort files by frame number
+        std::sort(imageFiles.begin(), imageFiles.end());
+
+        if (!imageFiles.empty()) {
+            // Determine the appropriate FPS based on actual recording data
+            double fps = 5.0; // Default fallback FPS
+
+            // Method 1: Calculate actual FPS from timestamps
+            if (frameTimestamps.size() >= 2) {
+                uint64_t startTime = frameTimestamps.front();
+                uint64_t endTime = frameTimestamps.back();
+                double durationSec = (endTime - startTime) / 1000000000.0;
+
+                if (durationSec > 0) {
+                    fps = frameTimestamps.size() / durationSec;
+                    spdlog::info("Calculated FPS from timestamps: {:.2f}", fps);
+                }
+            }
+
+            // Method 2: If timestamps aren't reliable, try to calculate from file timestamps
+            if (fps <= 0.1 && imageFiles.size() >= 2) {
+                auto firstTime = fs::last_write_time(imageFiles.front());
+                auto lastTime = fs::last_write_time(imageFiles.back());
+
+                // Convert to duration
+                auto duration = lastTime - firstTime;
+                auto durationSec = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
+
+                if (durationSec > 0) {
+                    fps = imageFiles.size() / static_cast<double>(durationSec);
+                    spdlog::info("Calculated FPS from file timestamps: {:.2f}", fps);
+                }
+            }
+
+            // Method 3: Read from metadata if available
+            if (fps <= 0.1) {
+                std::string metadataPath = currentRecordingPath + "/metadata.txt";
+                if (fs::exists(metadataPath)) {
+                    std::ifstream metaFile(metadataPath);
+                    std::string line;
+
+                    while (std::getline(metaFile, line)) {
+                        if (line.find("Actual FPS:") != std::string::npos) {
+                            size_t pos = line.find(":");
+                            if (pos != std::string::npos) {
+                                std::string fpsStr = line.substr(pos + 1);
+                                try {
+                                    fps = std::stod(fpsStr);
+                                    spdlog::info("Found FPS in metadata: {:.2f}", fps);
+                                    break;
+                                } catch (...) {
+                                    // If parsing fails, continue with default
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Ensure a reasonable FPS range
+            fps = std::max(1.0, std::min(fps, 30.0));
+
+            // Create video writer
+            cv::VideoWriter videoWriter;
+            std::string videoPath = currentRecordingPath + "/recording.mp4";
+
+            // Read first image to get dimensions
+            cv::Mat firstImage = cv::imread(imageFiles[0]);
+            if (!firstImage.empty()) {
+                int fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+                videoWriter.open(videoPath, fourcc, fps, firstImage.size());
+
+                if (videoWriter.isOpened()) {
+                    spdlog::info("Creating MP4 video from PNG sequence at {:.2f} FPS...", fps);
+
+                    // Add each image to the video
+                    for (const auto& imagePath : imageFiles) {
+                        cv::Mat image = cv::imread(imagePath);
+                        if (!image.empty()) {
+                            videoWriter.write(image);
+                        }
+                    }
+
+                    videoWriter.release();
+                    spdlog::info("Created MP4 video at {}", videoPath);
+                } else {
+                    spdlog::error("Failed to create MP4 video writer");
                 }
             }
         }
-        std::sort(framesToProcess.begin(), framesToProcess.end());
-        spdlog::info("Found {} depth frame files", framesToProcess.size());
+    } catch (const std::exception& e) {
+        spdlog::error("Error creating MP4 from PNG sequence: {}", e.what());
     }
-
-    if (framesToProcess.empty()) {
-        spdlog::error("No frames found to process in {}", directory);
-        return false;
-    }
-
-    outFrames.reserve(framesToProcess.size());
-
-    // Open video capture if using video format
-    cv::VideoCapture videoCapture;
-    if (hasVideoFile) {
-        videoCapture.open(directory + "/color.mp4");
-        if (!videoCapture.isOpened()) {
-            spdlog::error("Failed to open color video file");
-            return false;
-        }
-    }
-
-    for (int frameIdx : framesToProcess) {
-        FramePair framePair;
-        framePair.timestamp = frameIdx; // Use frame index as timestamp if real one not available
-
-        // Load color image
-        if (hasVideoFile) {
-            // Seek to the right frame in the video
-            videoCapture.set(cv::CAP_PROP_POS_FRAMES, frameIdx);
-            if (!videoCapture.read(framePair.colorImage)) {
-                spdlog::warn("Failed to read color frame {} from video", frameIdx);
-                continue;
-            }
-        } else {
-            // Load from PNG
-            std::string colorPath = directory + "/color/frame_" + std::to_string(frameIdx) + ".png";
-            framePair.colorImage = cv::imread(colorPath);
-            if (framePair.colorImage.empty()) {
-                spdlog::warn("Failed to load color frame {}", frameIdx);
-                continue;
-            }
-        }
-
-        // Load raw depth data
-        std::string depthRawPath = directory + "/depth_raw/frame_" + std::to_string(frameIdx) + ".bin";
-        std::ifstream depthFile(depthRawPath, std::ios::binary);
-
-        if (depthFile.is_open()) {
-            // Read dimensions
-            int rows, cols;
-            depthFile.read(reinterpret_cast<char*>(&rows), sizeof(int));
-            depthFile.read(reinterpret_cast<char*>(&cols), sizeof(int));
-
-            // Allocate matrix
-            framePair.depthImage = cv::Mat(rows, cols, CV_16UC1);
-
-            // Read data
-            depthFile.read(reinterpret_cast<char*>(framePair.depthImage.data),
-                          framePair.depthImage.total() * framePair.depthImage.elemSize());
-            depthFile.close();
-        } else {
-            spdlog::warn("Failed to load raw depth data for frame {}", frameIdx);
-            continue;
-        }
-
-        outFrames.push_back(std::move(framePair));
-
-        // Log progress every 100 frames
-        if (outFrames.size() % 100 == 0) {
-            spdlog::info("Loaded {}/{} frames", outFrames.size(), framesToProcess.size());
-        }
-    }
-
-    if (hasVideoFile) {
-        videoCapture.release();
-    }
-
-    spdlog::info("Successfully loaded {} frames", outFrames.size());
-    return !outFrames.empty();
+}
+    spdlog::info("Frames saved to disk at {}", currentRecordingPath);
+    spdlog::info("Recorded {} frames", frameCounter);
+    return true;
 }

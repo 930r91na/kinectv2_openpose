@@ -46,6 +46,7 @@ private:
     bool useMaximumAccuracy;
     int keypointConfidenceThreshold;
     int batchSize;
+    bool performanceMode = false;  // New flag for faster processing mode
 
     // OpenPose model mapping to Kinect joints
     std::unordered_map<int, JointType> openposeToKinectJointMap;
@@ -93,6 +94,7 @@ public:
     void setMaximumAccuracy(bool enabled) { useMaximumAccuracy = enabled; }
     void setKeypointConfidenceThreshold(int threshold) { keypointConfidenceThreshold = threshold; }
     void setBatchSize(int size) { batchSize = size; }
+    void setPerformanceMode(bool enabled) { performanceMode = enabled; }
 
     // Core processing methods
     bool initialize();

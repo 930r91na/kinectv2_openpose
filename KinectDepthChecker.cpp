@@ -58,6 +58,7 @@ KinectDepthChecker::KinectDepthChecker() :
     m_pBodyFrameReader(nullptr),
     m_pBodyIndexFrameReader(nullptr),
 	m_pColorFrameReader(nullptr),
+	showWindows(false),
     initialized(false) {
     setupLogger();
     logger->info("KinectDepthChecker initialized");
@@ -153,93 +154,98 @@ bool KinectDepthChecker::initialize() {
     return true;
 }
 
-void KinectDepthChecker::update() {
-	static int frameCount = 0;
-	frameCount++;
+void KinectDepthChecker::update(bool visualize) {
+    static int frameCount = 0;
+    frameCount++;
 
-	// Start with a clean slate
-	skeletonImg = cv::Mat::zeros(cDepthHeight, cDepthWidth, CV_8UC3);
+    // Start with a clean slate
+    skeletonImg = cv::Mat::zeros(cDepthHeight, cDepthWidth, CV_8UC3);
 
-	// Process depth frame first
-	IDepthFrame* pDepthFrame = nullptr;
-	HRESULT hr = m_pDepthFrameReader->AcquireLatestFrame(&pDepthFrame);
-	if (SUCCEEDED(hr)) {
-		UINT16* depthArray = new UINT16[cDepthHeight * cDepthWidth];
-		pDepthFrame->CopyFrameDataToArray(cDepthHeight * cDepthWidth, depthArray);
-		rawDepthImg = cv::Mat(cDepthHeight, cDepthWidth, CV_16UC1, depthArray).clone();
+    // Process depth frame first
+    IDepthFrame* pDepthFrame = nullptr;
+    HRESULT hr = m_pDepthFrameReader->AcquireLatestFrame(&pDepthFrame);
+    if (SUCCEEDED(hr)) {
+        UINT16* depthArray = new UINT16[cDepthHeight * cDepthWidth];
+        pDepthFrame->CopyFrameDataToArray(cDepthHeight * cDepthWidth, depthArray);
+        rawDepthImg = cv::Mat(cDepthHeight, cDepthWidth, CV_16UC1, depthArray).clone();
 
-		// Normalize depth data for better visualization
-		cv::Mat depthMat(cDepthHeight, cDepthWidth, CV_16UC1, depthArray);
-		cv::normalize(depthMat, depthImg, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+        // Normalize depth data for better visualization
+        cv::Mat depthMat(cDepthHeight, cDepthWidth, CV_16UC1, depthArray);
+        cv::normalize(depthMat, depthImg, 0, 255, cv::NORM_MINMAX, CV_8UC1);
 
-		delete[] depthArray;
-		SafeRelease(pDepthFrame);
-	}
+        delete[] depthArray;
+        SafeRelease(pDepthFrame);
+    }
 
-	// Process color frame
-	IColorFrame* pColorFrame = nullptr;
-	hr = m_pColorFrameReader->AcquireLatestFrame(&pColorFrame);
-	if (SUCCEEDED(hr)) {
-		// Get color frame description
-		IFrameDescription* colorFrameDescription = nullptr;
-		hr = pColorFrame->get_FrameDescription(&colorFrameDescription);
+    // Process color frame
+    IColorFrame* pColorFrame = nullptr;
+    hr = m_pColorFrameReader->AcquireLatestFrame(&pColorFrame);
+    if (SUCCEEDED(hr)) {
+        // Get color frame description
+        IFrameDescription* colorFrameDescription = nullptr;
+        hr = pColorFrame->get_FrameDescription(&colorFrameDescription);
 
-		if (SUCCEEDED(hr)) {
-			int width = 0, height = 0;
-			colorFrameDescription->get_Width(&width);
-			colorFrameDescription->get_Height(&height);
+        if (SUCCEEDED(hr)) {
+            int width = 0, height = 0;
+            colorFrameDescription->get_Width(&width);
+            colorFrameDescription->get_Height(&height);
 
-			// Make sure our Mat is the right size
-			if (colorImg.cols != width || colorImg.rows != height) {
-				colorImg = cv::Mat(height, width, CV_8UC4);
-			}
+            // Make sure our Mat is the right size
+            if (colorImg.cols != width || colorImg.rows != height) {
+                colorImg = cv::Mat(height, width, CV_8UC4);
+            }
 
-			// Copy the color data to our Mat
-			hr = pColorFrame->CopyConvertedFrameDataToArray(
-				width * height * 4,  // 4 bytes per pixel (BGRA)
-				reinterpret_cast<BYTE*>(colorImg.data),
-				ColorImageFormat_Bgra
-			);
+            // Copy the color data to our Mat
+            hr = pColorFrame->CopyConvertedFrameDataToArray(
+                width * height * 4,  // 4 bytes per pixel (BGRA)
+                reinterpret_cast<BYTE*>(colorImg.data),
+                ColorImageFormat_Bgra
+            );
 
-			if (SUCCEEDED(hr)) {
-				logger->debug("Color frame acquired successfully");
-			} else {
-				logger->error("Failed to copy color frame data");
-			}
+            if (SUCCEEDED(hr)) {
+                logger->debug("Color frame acquired successfully");
+            } else {
+                logger->error("Failed to copy color frame data");
+            }
 
-			SafeRelease(colorFrameDescription);
-		}
+            SafeRelease(colorFrameDescription);
+        }
 
-		SafeRelease(pColorFrame);
-	}
+        SafeRelease(pColorFrame);
+    }
 
-	// Process body frame
-	IBodyFrame* pBodyFrame = nullptr;
-	hr = m_pBodyFrameReader->AcquireLatestFrame(&pBodyFrame);
-	if (SUCCEEDED(hr)) {
-		IBody* ppBodies[BODY_COUNT] = { nullptr };
-		hr = pBodyFrame->GetAndRefreshBodyData(_countof(ppBodies), ppBodies);
+    // Process body frame
+    IBodyFrame* pBodyFrame = nullptr;
+    hr = m_pBodyFrameReader->AcquireLatestFrame(&pBodyFrame);
+    if (SUCCEEDED(hr)) {
+        IBody* ppBodies[BODY_COUNT] = { nullptr };
+        hr = pBodyFrame->GetAndRefreshBodyData(_countof(ppBodies), ppBodies);
 
-		if (SUCCEEDED(hr)) {
-			logger->debug("Processing body frame");
-			ProcessBody(BODY_COUNT, ppBodies);
-		}
+        if (SUCCEEDED(hr)) {
+            logger->debug("Processing body frame");
+            ProcessBody(BODY_COUNT, ppBodies);
+        }
 
-		for (int i = 0; i < _countof(ppBodies); ++i) {
-			SafeRelease(ppBodies[i]);
-		}
-		SafeRelease(pBodyFrame);
-	}
+        for (int i = 0; i < _countof(ppBodies); ++i) {
+            SafeRelease(ppBodies[i]);
+        }
+        SafeRelease(pBodyFrame);
+    }
 
-	// Draw frame info
-	cv::putText(skeletonImg, "Frame: " + std::to_string(frameCount),
-				cv::Point(30, 30), cv::FONT_HERSHEY_SIMPLEX, 1,
-				cv::Scalar(255,255,255), 2);
+    // Draw frame info
+    cv::putText(skeletonImg, "Frame: " + std::to_string(frameCount),
+                cv::Point(30, 30), cv::FONT_HERSHEY_SIMPLEX, 1,
+                cv::Scalar(255,255,255), 2);
 
-	// Display images
-	cv::imshow("Depth Image", depthImg);
-	cv::imshow("Skeleton", skeletonImg);
-	cv::waitKey(30);
+    // Only display images if visualization is enabled
+    if (visualize && showWindows) {
+        try {
+            cv::imshow("Depth Image", depthImg);
+            cv::imshow("Skeleton", skeletonImg);
+        } catch (const cv::Exception& e) {
+            logger->error("OpenCV error in visualization: {}", e.what());
+        }
+    }
 }
 
 void KinectDepthChecker::checkDepthFPS(int durationSeconds) const {

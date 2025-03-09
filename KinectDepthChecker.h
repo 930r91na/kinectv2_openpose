@@ -40,6 +40,8 @@ class KinectDepthChecker {
     cv::Mat colorImg;
     cv::Mat rawDepthImg;
 
+    // Visualization mode
+    bool showWindows;
 
 public:
     KinectDepthChecker();
@@ -50,12 +52,15 @@ public:
     KinectDepthChecker& operator=(const KinectDepthChecker&) = delete;
 
     bool initialize();
-    void update();
+    void update(bool visualize = false);  // Added parameter to control visualization
     void checkDepthFPS(int durationSeconds = 10) const;
     cv::Mat getColorImage() const;
     cv::Mat getDepthImage() const;
+    cv::Mat getSkeletonImage() const { return skeletonImg.clone(); }
     ICoordinateMapper* getCoordinateMapper() const { return m_pCoordinateMapper; }
 
+    // Enable/disable visualization windows
+    void setShowWindows(bool show) { showWindows = show; }
 
 private:
     // Functions to process skeleton

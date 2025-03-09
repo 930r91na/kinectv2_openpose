@@ -5,8 +5,19 @@
 #include <iostream>
 #include <filesystem>
 #include <spdlog/spdlog.h>
+#include <chrono>
 
 namespace fs = std::filesystem;
+
+// Generate a unique session ID based on timestamp and name
+std::string generateSessionId(const std::string& baseName) {
+    auto now = std::chrono::system_clock::now();
+    auto nowTime = std::chrono::system_clock::to_time_t(now);
+
+    std::stringstream ss;
+    ss << baseName << "_" << std::put_time(std::localtime(&nowTime), "%Y%m%d_%H%M%S");
+    return ss.str();
+}
 
 void displayHelp() {
     std::cout << "KinectV2 OpenPose Integrator" << std::endl;
@@ -38,11 +49,18 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--process") {
             isRecordMode = false;
+            // Get the session name if provided
+            if (i+1 < argc && argv[i+1][0] != '-') {
+                recordingName = argv[i+1];
+                i++;
+            }
         } else if (arg == "--record") {
             isRecordMode = true;
-        } else if ((arg == "--name" || arg == "--record" || arg == "--process") && i+1 < argc) {
-            recordingName = argv[i+1];
-            i++;
+            // Get the session name if provided
+            if (i+1 < argc && argv[i+1][0] != '-') {
+                recordingName = argv[i+1];
+                i++;
+            }
         } else if (arg == "--interval" && i+1 < argc) {
             processingInterval = std::stoi(argv[i+1]);
             i++;
@@ -60,14 +78,31 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Generate a unique session ID if we're recording
+    std::string sessionId = isRecordMode ?
+        generateSessionId(recordingName) : recordingName;
+
+    // Display the session ID for clarity
+    if (isRecordMode) {
+        spdlog::info("Session ID: {}", sessionId);
+    } else {
+        spdlog::info("Processing session: {}", sessionId);
+    }
+
     // Load configuration
     ConfigManager config(configFile);
+    spdlog::info("Loaded configuration from {}", configFile);
+
     std::string openPosePath = config.get<std::string>("openpose_path",
         "C:\\Users\\koqui\\OpenPose\\openpose\\bin\\OpenPoseDemo.exe");
     int netResolution = config.get<int>("net_resolution", 368);
     bool useMaximumAccuracy = config.get<bool>("use_maximum_accuracy", false);
     int confidenceThreshold = config.get<int>("keypoint_confidence_threshold", 40);
     int frameInterval = config.get<int>("process_every_n_frames", processingInterval);
+
+    // Get recording and output directories
+    std::string recordingsBaseDir = config.get<std::string>("recording_directory", "recordings");
+    std::string outputBaseDir = config.get<std::string>("output_directory", "processed");
 
     // Override config with command line if specified
     if (processingInterval != 1) {
@@ -88,6 +123,7 @@ int main(int argc, char** argv) {
 
             // Initialize Kinect
             KinectDepthChecker kinect;
+            kinect.setShowWindows(false); // Disable default windows
 
             bool init = kinect.initialize();
             spdlog::info("Waiting for Kinect to fully initialize...");
@@ -99,22 +135,49 @@ int main(int argc, char** argv) {
                 return -1;
             }
 
-            // Initialize recorder
-            std::string outputDir = "recordings/" + recordingName;
-            FrameRecorder recorder(outputDir);
+            // Make sure recording directory exists
+            if (!fs::exists(recordingsBaseDir)) {
+                fs::create_directories(recordingsBaseDir);
+                spdlog::info("Created recordings directory: {}", recordingsBaseDir);
+            }
+
+            // Initialize recorder with full session path
+            std::string sessionDir = recordingsBaseDir + "/" + sessionId;
+            spdlog::info("Recording will be saved to: {}", sessionDir);
+
+            FrameRecorder recorder(sessionDir);
 
             // Set recorder options
             recorder.setProcessingInterval(frameInterval);
             recorder.setUseVideoCompression(useCompression);
 
-            // Set up UI
-            cv::namedWindow("Color Feed", cv::WINDOW_NORMAL);
-            cv::namedWindow("Depth Feed", cv::WINDOW_NORMAL);
+            // Set up a single control window
+            cv::namedWindow("Kinect Recorder Control", cv::WINDOW_NORMAL);
+            cv::resizeWindow("Kinect Recorder Control", 1280, 720);
 
             // Main loop
             bool running = true;
             bool isRecording = false;
             int frameCount = 0;
+
+            // Default empty images for display
+            cv::Mat controlImg = cv::Mat(720, 1280, CV_8UC3, cv::Scalar(40, 40, 40));
+            cv::Mat colorSmall, depthSmall, skeletonSmall;
+
+            // Display instructions on the control window
+            cv::putText(controlImg, "KINECT RECORDER CONTROL",
+                       cv::Point(30, 60), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255, 255, 255), 2);
+            cv::putText(controlImg, "Press 'r' to Start/Stop recording",
+                       cv::Point(30, 120), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 1);
+            cv::putText(controlImg, "Press 's' to Save the recording",
+                       cv::Point(30, 160), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 1);
+            cv::putText(controlImg, "Press 'q' to Quit",
+                       cv::Point(30, 200), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 1);
+            cv::putText(controlImg, "Session: " + sessionId,
+                       cv::Point(30, 260), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(200, 200, 200), 1);
+
+            // Show initial window
+            cv::imshow("Kinect Recorder Control", controlImg);
 
             spdlog::info("Ready to record. Controls:");
             spdlog::info("  'r' - Start/stop recording");
@@ -123,91 +186,211 @@ int main(int argc, char** argv) {
 
             auto lastFpsTime = std::chrono::high_resolution_clock::now();
             int displayFps = 0;
+            int recordedFrames = 0;
+
+            std::string statusText = "READY TO RECORD";
 
             while (running) {
-                // Update Kinect data
-                kinect.update();
+                // Update Kinect data (without showing internal windows)
+                kinect.update(false);
                 frameCount++;
 
                 // Get images
                 cv::Mat colorImg = kinect.getColorImage();
                 cv::Mat depthImg = kinect.getDepthImage();
+                cv::Mat skeletonImg = kinect.getSkeletonImage();
                 cv::Mat depthViz;
 
                 // Skip if frames are empty
                 if (colorImg.empty() || depthImg.empty()) {
                     spdlog::warn("Empty frame detected");
+                    // Still show the window with status
+                    controlImg = cv::Mat(720, 1280, CV_8UC3, cv::Scalar(40, 40, 40));
+                    cv::putText(controlImg, "STATUS: WAITING FOR FRAMES",
+                               cv::Point(700, 100), cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(255, 255, 255), 2);
+                    cv::putText(controlImg, "Press 'q' to Quit",
+                               cv::Point(700, 240), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(200, 200, 200), 1);
+                    cv::imshow("Kinect Recorder Control", controlImg);
+
+                    if (cv::waitKey(30) == 'q') {
+                        running = false;
+                    }
                     continue;
                 }
 
                 // Add frame to recorder if recording
                 if (isRecording) {
                     recorder.addFrame(colorImg, depthImg);
+                    recordedFrames = recorder.getFrameCount();
                 }
 
                 // Create visualization of the depth image
                 cv::normalize(depthImg, depthViz, 0, 255, cv::NORM_MINMAX, CV_8UC1);
                 cv::applyColorMap(depthViz, depthViz, cv::COLORMAP_JET);
 
-                // Add recording indicator
-                if (isRecording) {
-                    cv::putText(colorImg, "RECORDING", cv::Point(30, 30),
-                               cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
-                    cv::circle(colorImg, cv::Point(20, 20), 10, cv::Scalar(0, 0, 255), -1);
+                // Make sure all images are 3-channel BGR for display
+                if (colorImg.channels() == 4) {
+                    cv::cvtColor(colorImg, colorImg, cv::COLOR_BGRA2BGR);
+                } else if (colorImg.channels() == 1) {
+                    cv::cvtColor(colorImg, colorImg, cv::COLOR_GRAY2BGR);
                 }
+
+                if (depthViz.channels() == 1) {
+                    cv::cvtColor(depthViz, depthViz, cv::COLOR_GRAY2BGR);
+                } else if (depthViz.channels() == 4) {
+                    cv::cvtColor(depthViz, depthViz, cv::COLOR_BGRA2BGR);
+                }
+
+                if (skeletonImg.channels() == 1) {
+                    cv::cvtColor(skeletonImg, skeletonImg, cv::COLOR_GRAY2BGR);
+                } else if (skeletonImg.channels() == 4) {
+                    cv::cvtColor(skeletonImg, skeletonImg, cv::COLOR_BGRA2BGR);
+                }
+
+                // Resize images for display
+                cv::resize(colorImg, colorSmall, cv::Size(640, 360));
+                cv::resize(depthViz, depthSmall, cv::Size(320, 240));
+                cv::resize(skeletonImg, skeletonSmall, cv::Size(320, 240));
 
                 // Calculate FPS
                 auto currentTime = std::chrono::high_resolution_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastFpsTime);
-
                 if (elapsed.count() >= 1) {
                     displayFps = frameCount;
                     frameCount = 0;
                     lastFpsTime = currentTime;
                 }
 
-                // Display FPS
-                cv::putText(colorImg, "FPS: " + std::to_string(displayFps),
-                           cv::Point(colorImg.cols - 150, 30), cv::FONT_HERSHEY_SIMPLEX,
-                           1, cv::Scalar(255, 255, 255), 2);
+                // Update control display
+                controlImg = cv::Mat(720, 1280, CV_8UC3, cv::Scalar(40, 40, 40));
 
-                // Display images
-                cv::resize(colorImg, colorImg, cv::Size(), 0.5, 0.5);
-                cv::imshow("Color Feed", colorImg);
-                cv::imshow("Depth Feed", depthViz);
+                // Draw color feed at top - ensure ROI is within bounds
+                if (colorSmall.rows > 0 && colorSmall.cols > 0) {
+                    colorSmall.copyTo(controlImg(cv::Rect(20, 40,
+                        std::min(colorSmall.cols, controlImg.cols - 20),
+                        std::min(colorSmall.rows, controlImg.rows - 40))));
+                }
 
-                // Handle keyboard input
+                // Draw depth and skeleton below - ensure ROIs are within bounds
+                if (depthSmall.rows > 0 && depthSmall.cols > 0) {
+                    depthSmall.copyTo(controlImg(cv::Rect(20, 420,
+                        std::min(depthSmall.cols, controlImg.cols - 20),
+                        std::min(depthSmall.rows, controlImg.rows - 420))));
+                }
+
+                if (skeletonSmall.rows > 0 && skeletonSmall.cols > 0) {
+                    skeletonSmall.copyTo(controlImg(cv::Rect(360, 420,
+                        std::min(skeletonSmall.cols, controlImg.cols - 360),
+                        std::min(skeletonSmall.rows, controlImg.rows - 420))));
+                }
+
+                // Status text
+                cv::putText(controlImg, "STATUS: " + statusText,
+                           cv::Point(700, 100), cv::FONT_HERSHEY_SIMPLEX, 0.9,
+                           isRecording ? cv::Scalar(0, 0, 255) : cv::Scalar(255, 255, 255), 2);
+
+                // Instructions
+                cv::putText(controlImg, "Press 'r' to Start/Stop recording",
+                           cv::Point(700, 160), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(200, 200, 200), 1);
+                cv::putText(controlImg, "Press 's' to Save the recording",
+                           cv::Point(700, 200), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(200, 200, 200), 1);
+                cv::putText(controlImg, "Press 'q' to Quit",
+                           cv::Point(700, 240), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(200, 200, 200), 1);
+
+                // Recording info
+                cv::rectangle(controlImg, cv::Point(690, 270), cv::Point(1260, 380), cv::Scalar(60, 60, 60), -1);
+                cv::putText(controlImg, "Session: " + sessionId,
+                           cv::Point(700, 300), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(200, 200, 200), 1);
+                cv::putText(controlImg, "Frames: " + std::to_string(recordedFrames),
+                           cv::Point(700, 330), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(200, 200, 200), 1);
+                cv::putText(controlImg, "FPS: " + std::to_string(displayFps),
+                           cv::Point(700, 360), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(200, 200, 200), 1);
+
+                // Add recording indicator
+                if (isRecording) {
+                    cv::circle(controlImg, cv::Point(670, 100), 10, cv::Scalar(0, 0, 255), -1);
+                }
+
+                // Display the control window
+                cv::imshow("Kinect Recorder Control", controlImg);
+
+                // Handle keyboard input in a non-blocking way
                 int key = cv::waitKey(1);
 
                 if (key == 'q' || key == 'Q') {
+                    statusText = "QUITTING...";
+                    spdlog::info("Quitting application...");
+                    cv::imshow("Kinect Recorder Control", controlImg);
+                    cv::waitKey(1);
+
                     running = false;
-                } else if (key == 'r' || key == 'R') {
+
+                    // Stop recording if active before quitting
                     if (isRecording) {
+                        spdlog::info("Stopping active recording...");
                         recorder.stopRecording();
                         isRecording = false;
+                    }
+
+                } else if (key == 'r' || key == 'R') {
+                    if (isRecording) {
+                        statusText = "STOPPING RECORDING...";
+                        cv::imshow("Kinect Recorder Control", controlImg);
+                        cv::waitKey(1);
+
+                        spdlog::info("Stopping recording...");
+                        recorder.stopRecording();
+                        isRecording = false;
+                        statusText = "READY";
+
                         spdlog::info("Recording stopped");
                     } else {
+                        statusText = "STARTING RECORDING...";
+                        cv::imshow("Kinect Recorder Control", controlImg);
+                        cv::waitKey(1);
+
+                        spdlog::info("Starting recording to {}", sessionDir);
                         recorder.startRecording();
                         isRecording = true;
+                        statusText = "RECORDING";
+
                         spdlog::info("Recording started");
                     }
                 } else if (key == 's' || key == 'S') {
                     if (isRecording) {
+                        statusText = "STOPPING RECORDING...";
+                        cv::imshow("Kinect Recorder Control", controlImg);
+                        cv::waitKey(1);
+
+                        spdlog::info("Stopping recording before save...");
                         recorder.stopRecording();
                         isRecording = false;
                     }
 
-                    spdlog::info("Saving frames to disk...");
-                    recorder.saveFramesToDisk();
-                    spdlog::info("Recorded {} frames", recorder.getFrameCount());
+                    statusText = "SAVING RECORDING...";
+                    cv::imshow("Kinect Recorder Control", controlImg);
+                    cv::waitKey(1);
+
+                    spdlog::info("Saving frames to disk at {}", sessionDir);
+
+                    // Do saving in a separate thread to avoid UI freezing
+                    std::thread saveThread([&]() {
+                        bool saveResult = recorder.saveFramesToDisk();
+                        if (saveResult) {
+                            spdlog::info("Successfully saved {} frames", recorder.getFrameCount());
+                            recordedFrames = recorder.getFrameCount();
+                            statusText = "SAVED " + std::to_string(recordedFrames) + " FRAMES";
+                        } else {
+                            spdlog::error("Failed to save recording");
+                            statusText = "SAVE FAILED";
+                        }
+                    });
+                    saveThread.detach();
                 }
             }
 
             // Clean up
-            if (isRecording) {
-                recorder.stopRecording();
-            }
-
+            cv::destroyAllWindows();
             CoUninitialize();
 
         } catch (const std::exception& e) {
@@ -215,16 +398,31 @@ int main(int argc, char** argv) {
             return -1;
         }
     } else {
-        // PROCESSING MODE
+        // PROCESSING MODE - Rest of code remains the same
+        // [Processing code here - no changes needed]
         spdlog::info("Processing recorded frames");
 
-        std::string recordingDir = "recordings/" + recordingName;
+        // Verify the full path for the recording directory
+        std::string recordingDir = recordingsBaseDir + "/" + sessionId;
         if (!fs::exists(recordingDir)) {
             spdlog::error("Recording directory not found: {}", recordingDir);
+            spdlog::info("Available recordings:");
+
+            // List available recordings
+            if (fs::exists(recordingsBaseDir)) {
+                for (const auto& entry : fs::directory_iterator(recordingsBaseDir)) {
+                    if (entry.is_directory()) {
+                        spdlog::info("  {}", entry.path().filename().string());
+                    }
+                }
+            }
+
             return -1;
         }
 
-        std::string outputDir = "processed/" + recordingName;
+        std::string outputDir = outputBaseDir + "/" + sessionId;
+        spdlog::info("Will process {} using {} threads", recordingDir, numThreads);
+        spdlog::info("Output will be saved to {}", outputDir);
 
         try {
             // Initialize COM for Kinect
@@ -235,6 +433,8 @@ int main(int argc, char** argv) {
 
             // Initialize Kinect to get coordinate mapper
             KinectDepthChecker kinect;
+            kinect.setShowWindows(false); // No need for visualization
+
             if (!kinect.initialize()) {
                 spdlog::error("Failed to initialize Kinect");
                 CoUninitialize();
@@ -253,6 +453,13 @@ int main(int argc, char** argv) {
                 return -1;
             }
 
+            // Create output directory if it doesn't exist
+            if (!fs::exists(outputDir)) {
+                fs::create_directories(outputDir);
+            }
+
+            spdlog::info("Starting processing...");
+
             // Process recording using multi-threading
             bool success = openpose.processRecordingDirectory(
                 recordingDir,
@@ -262,7 +469,8 @@ int main(int argc, char** argv) {
             );
 
             if (success) {
-                spdlog::info("Successfully processed recording at {}", outputDir);
+                spdlog::info("Successfully processed recording");
+                spdlog::info("Results saved to {}", outputDir);
             } else {
                 spdlog::error("Failed to process recording");
             }

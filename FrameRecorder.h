@@ -20,7 +20,7 @@ struct FramePair {
 
 class FrameRecorder {
 private:
-    std::queue<FramePair> frameQueue;     // Buffer queue instead of vector
+    std::queue<FramePair> frameQueue;     // Buffer queue for frames
     std::string outputDirectory;
     std::atomic<bool> isRecording{false};
     std::mutex framesMutex;
@@ -35,13 +35,19 @@ private:
     std::string currentRecordingPath;
     std::atomic<int> frameCounter{0}; // Make atomic for thread safety
 
+    // Timestamp tracking for FPS calculation
+    std::chrono::high_resolution_clock::time_point recordingStartTime;
+    std::chrono::high_resolution_clock::time_point lastFrameTime;
+    std::vector<uint64_t> frameTimestamps;
+
     // Configuration
     const size_t MAX_QUEUE_SIZE = 30;    // Buffer ~1 second at 30fps
     int processingInterval = 1;          // Process every N frames
     bool useVideoCompression = true;     // Use video compression for color frames
+    int targetFps = 30;                  // Target recording FPS
+    bool frameLimitingEnabled = false;    // Limit frame rate to target FPS
 
     void processFrameQueue();
-    void frameWriterWorker();
 
 public:
     explicit FrameRecorder(std::string outputDir = "recorded_frames");
@@ -56,8 +62,11 @@ public:
     // Configuration options
     void setProcessingInterval(int interval) { processingInterval = interval; }
     void setUseVideoCompression(bool use) { useVideoCompression = use; }
+    void setTargetFPS(int fps);
+    void setFrameLimiting(bool enabled);
+
+    int getTargetFPS() const { return targetFps; }
+    bool isFrameLimitingEnabled() const { return frameLimitingEnabled; }
 
     static bool loadRecordedFrames(const std::string& directory, std::vector<FramePair>& outFrames);
-    static void processRecordedFrames(const std::string& framesDir, const std::string& openPosePath,
-                                    const std::string& outputDir);
 };
