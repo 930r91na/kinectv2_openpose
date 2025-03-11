@@ -1,72 +1,123 @@
 #pragma once
 
-#include <vector>
 #include <string>
-#include <opencv2/opencv.hpp>
-#include <Kinect.h>
-#include <thread>
-#include <mutex>
-#include <atomic>
 #include <filesystem>
+#include <vector>
 #include <queue>
+#include <mutex>
+#include <thread>
+#include <atomic>
 #include <condition_variable>
+#include <optional>
+#include <chrono>
 #include <fstream>
+#include <opencv2/opencv.hpp>
 
-struct FramePair {
-    cv::Mat colorImage;
-    cv::Mat depthImage;
-    UINT64 timestamp;
-};
-
+/**
+ * @brief Modern frame recorder for Kinect data
+ *
+ * This class handles recording and storage of color and depth frames
+ * from the Kinect, using modern C++ features and thread-safe operations.
+ */
 class FrameRecorder {
-private:
-    std::queue<FramePair> frameQueue;     // Buffer queue for frames
-    std::string outputDirectory;
-    std::atomic<bool> isRecording{false};
-    std::mutex framesMutex;
-    std::thread writerThread;
-    std::atomic<bool> shouldWrite{false};
-    std::atomic<bool> isProcessing{false};
-    std::condition_variable processingCv;
-
-    // Stream handling
-    cv::VideoWriter colorVideoWriter;
-    std::ofstream metadataStream;
-    std::string currentRecordingPath;
-    std::atomic<int> frameCounter{0}; // Make atomic for thread safety
-
-    // Timestamp tracking for FPS calculation
-    std::chrono::high_resolution_clock::time_point recordingStartTime;
-    std::chrono::high_resolution_clock::time_point lastFrameTime;
-    std::vector<uint64_t> frameTimestamps;
-
-    // Configuration
-    const size_t MAX_QUEUE_SIZE = 30;    // Buffer ~1 second at 30fps
-    int processingInterval = 1;          // Process every N frames
-    bool useVideoCompression = true;     // Use video compression for color frames
-    int targetFps = 30;                  // Target recording FPS
-    bool frameLimitingEnabled = false;    // Limit frame rate to target FPS
-
-    void processFrameQueue();
-
 public:
-    explicit FrameRecorder(std::string outputDir = "recorded_frames");
+    // Configuration options
+    struct RecordingOptions {
+        bool useVideoCompression = true;
+        int targetFps = 30;
+        bool limitFrameRate = false;
+        int processEveryNFrames = 1;
+        std::string outputDirectory = "recordings";
+        bool saveOriginalFrames = true;
+        bool saveOverlayFrames = false;
+    };
+
+    // Frame data structure
+    struct FrameData {
+        cv::Mat colorImage;
+        cv::Mat depthImage;
+        std::chrono::system_clock::time_point timestamp;
+    };
+
+    // Statistics from a recording session
+    struct RecordingStats {
+        int totalFrames = 0;
+        int colorFramesSaved = 0;
+        int depthFramesSaved = 0;
+        double recordingDurationSeconds = 0.0;
+        double averageFps = 0.0;
+        std::string outputPath;
+    };
+
+    // Constructor and destructor
+    explicit FrameRecorder(RecordingOptions options = {});
     ~FrameRecorder();
 
-    void startRecording();
-    void stopRecording();
-    void addFrame(const cv::Mat& colorImg, const cv::Mat& depthImg);
-    bool saveFramesToDisk();
-    size_t getFrameCount() const { return frameCounter; }
+    // Disable copying
+    FrameRecorder(const FrameRecorder&) = delete;
+    FrameRecorder& operator=(const FrameRecorder&) = delete;
 
-    // Configuration options
-    void setProcessingInterval(int interval) { processingInterval = interval; }
-    void setUseVideoCompression(bool use) { useVideoCompression = use; }
-    void setTargetFPS(int fps);
-    void setFrameLimiting(bool enabled);
+    // Enable moving
+    FrameRecorder(FrameRecorder&&) noexcept;
+    FrameRecorder& operator=(FrameRecorder&&) noexcept;
 
-    int getTargetFPS() const { return targetFps; }
-    bool isFrameLimitingEnabled() const { return frameLimitingEnabled; }
+    // Recording control
+    bool startRecording(const std::string& sessionId = "");
+    bool stopRecording();
+    bool isRecording() const noexcept;
 
-    static bool loadRecordedFrames(const std::string& directory, std::vector<FramePair>& outFrames);
+    // Frame submission - returns true if frame was accepted
+    bool addFrame(const cv::Mat& colorFrame, const cv::Mat& depthFrame);
+
+    // Status and statistics
+    int getFrameCount() const noexcept;
+    std::optional<RecordingStats> getRecordingStats() const;
+
+    // Options
+    void setRecordingOptions(const RecordingOptions& newOptions);
+    const RecordingOptions& getRecordingOptions() const noexcept;
+
+    // Load recorded frames
+    static std::vector<FrameData> loadRecordedFrames(const std::string& directory);
+
+    // Cleanup temporary files after processing
+    void cleanupProcessingTemp(const std::string& sessionId);
+
+private:
+    // Implementation details
+    struct RecordingSession {
+        std::filesystem::path outputPath;
+        std::chrono::system_clock::time_point startTime;
+        std::chrono::system_clock::time_point lastFrameTime;
+        std::atomic<int> frameCounter{0};
+        std::vector<int64_t> frameTimestamps;
+        std::ofstream metadataStream;
+        cv::VideoWriter colorVideoWriter;
+    };
+
+    // Processing thread function
+    void processFrameQueue();
+
+    // Helper methods
+    bool saveFrameToDisk(const FrameData& frame, int frameIndex);
+    std::string generateUniqueSessionId() const;
+
+    // New helper methods
+    cv::Mat getFrameFromBestSource(int frameIndex);
+    cv::Mat createFrameWithOverlay(const cv::Mat& originalFrame, int frameIndex);
+
+    // Member variables
+    RecordingOptions options;
+    std::unique_ptr<RecordingSession> currentSession;
+    std::atomic<bool> isRecordingActive{false};
+
+    // Thread synchronization
+    std::queue<FrameData> frameQueue;
+    std::mutex queueMutex;
+    std::condition_variable queueCondition;
+    std::thread processingThread;
+    std::atomic<bool> shouldProcessFrames{false};
+
+    // Constants
+    static constexpr size_t MAX_QUEUE_SIZE = 60;
 };
