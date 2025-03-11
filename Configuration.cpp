@@ -13,7 +13,7 @@ Configuration::Configuration(std::filesystem::path configPath)
     settings["net_resolution"] = 368;
     settings["use_maximum_accuracy"] = false;
     settings["keypoint_confidence_threshold"] = 40;
-    settings["process_every_n_frames"] = 15;
+    settings["process_every_n_frames"] = 1;
     settings["recording_directory"] = std::filesystem::path("recordings");
     settings["output_directory"] = std::filesystem::path("processed");
     settings["show_ui"] = true;

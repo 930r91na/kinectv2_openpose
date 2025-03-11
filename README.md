@@ -57,7 +57,7 @@ openpose_path = C:\path\to\OpenPose\bin\OpenPoseDemo.exe
 net_resolution = 368
 use_maximum_accuracy = false
 keypoint_confidence_threshold = 40
-process_every_n_frames = 15
+process_every_n_frames = 1
 recording_directory = recordings
 output_directory = processed
 ```
