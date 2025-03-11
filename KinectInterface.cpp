@@ -274,8 +274,8 @@ public:
             }
             
             // Release body instances
-            for (int i = 0; i < _countof(bodies); ++i) {
-                SafeRelease(bodies[i]);
+            for (auto & body : bodies) {
+                SafeRelease(body);
             }
             
             SafeRelease(bodyFrame);

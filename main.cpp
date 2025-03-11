@@ -161,8 +161,7 @@ int main(int argc, char** argv) {
             app.run();
 
             // Get results
-            auto result = app.getProcessingResult();
-            if (result) {
+            if (auto result = app.getProcessingResult()) {
                 spdlog::info("Processing complete:");
                 spdlog::info("  Frames processed: {}", result->framesProcessed);
                 spdlog::info("  People detected: {}", result->peopleDetected);

@@ -82,7 +82,6 @@ public:
     // Frame access methods (using std::optional to indicate potential absence)
     std::optional<cv::Mat> getColorFrame() const;
     std::optional<cv::Mat> getDepthFrame() const;
-    std::optional<cv::Mat> getBodyIndexFrame() const;
     std::optional<cv::Mat> getSkeletonVisualization() const;
 
     // Get tracked bodies

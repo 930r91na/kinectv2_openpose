@@ -8,7 +8,6 @@
 #include <fstream>
 #include <sstream>
 #include <memory>
-#include <any>
 #include <vector>
 #include <iostream>
 #include <type_traits>

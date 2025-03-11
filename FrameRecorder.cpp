@@ -251,7 +251,6 @@ std::vector<FrameRecorder::FrameData> FrameRecorder::loadRecordedFrames(const st
     bool hasVideoFile = fs::exists(directory + "/color.mp4");
     bool hasColorDir = fs::exists(directory + "/color");
     bool hasProcessingDir = fs::exists(directory + "/processing_temp");
-    bool hasDepthDir = fs::exists(directory + "/depth_raw");
 
     // Check for processing temp directory first as it contains uncompressed originals
     fs::path frameSourceDir;
@@ -416,7 +415,6 @@ void FrameRecorder::processFrameQueue() {
 
     while (shouldProcessFrames) {
         FrameData frame;
-        bool hasFrame = false;
 
         // Get a frame from the queue
         {
@@ -425,7 +423,6 @@ void FrameRecorder::processFrameQueue() {
             if (!frameQueue.empty()) {
                 frame = std::move(frameQueue.front());
                 frameQueue.pop();
-                hasFrame = true;
                 queueCondition.notify_all(); // Notify if queue was full
             } else if (!isRecordingActive) {
                 // No more frames and not recording
@@ -437,7 +434,7 @@ void FrameRecorder::processFrameQueue() {
             }
         }
 
-        if (hasFrame && currentSession) {
+        if (currentSession) {
             // Get frame index and increment counter
             int frameIndex = currentSession->frameCounter.fetch_add(1);
             processedFrames++;
@@ -622,7 +619,6 @@ bool FrameRecorder::stopRecording() {
             double standardFps = 30.0;
 
             // Try different video codecs in case one fails
-            int fourcc;
             std::vector<std::pair<std::string, int>> codecs = {
                 {"XVID", cv::VideoWriter::fourcc('X', 'V', 'I', 'D')},
                 {"MJPG", cv::VideoWriter::fourcc('M', 'J', 'P', 'G')},
@@ -637,7 +633,6 @@ bool FrameRecorder::stopRecording() {
                 videoWriter.open(videoPath, codec.second, standardFps, firstFrame.size());
 
                 if (videoWriter.isOpened()) {
-                    fourcc = codec.second;
                     videoWriterCreated = true;
                     spdlog::info("Successfully opened video writer with codec: {}", codec.first);
                     break;
@@ -789,7 +784,7 @@ bool FrameRecorder::stopRecording() {
         if (processFramesFile.is_open()) {
             // Look at frameTimestamps to identify original frames
             if (!currentSession->frameTimestamps.empty()) {
-                const int64_t MIN_DELTA_NS = 50 * 1000000; // 50ms in nanoseconds
+                constexpr int64_t MIN_DELTA_NS = 50 * 1000000; // 50ms in nanoseconds
                 int64_t lastTs = currentSession->frameTimestamps[0];
 
                 // First frame is always original

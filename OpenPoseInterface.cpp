@@ -3,15 +3,10 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <thread>
-#include <mutex>
-#include <queue>
-#include <condition_variable>
 #include <atomic>
 #include <chrono>
 #include <iomanip>
 #include <algorithm>
-#include <set>
 
 namespace fs = std::filesystem;
 
@@ -209,39 +204,6 @@ public:
         return frameTimestamps;
     }
 
-    // Identify unique frames based on timestamps (remove duplicates)
-    std::vector<int> identifyUniqueFrames(const std::vector<std::pair<int, int64_t>>& timestamps) {
-        std::vector<int> uniqueFrames;
-
-        if (timestamps.empty()) {
-            return uniqueFrames;
-        }
-
-        // Add the first frame
-        uniqueFrames.push_back(timestamps.front().first);
-
-        // Use a minimum delta time threshold (in ms) to identify new frames
-        // For 10 FPS, frames should be about 100ms apart
-        const int64_t MIN_DELTA_NS = 50 * 1000000; // 50ms in nanoseconds
-
-        int64_t lastTimestamp = timestamps.front().second;
-
-        for (size_t i = 1; i < timestamps.size(); i++) {
-            int64_t currentTimestamp = timestamps[i].second;
-            int64_t delta = currentTimestamp - lastTimestamp;
-
-            // If the time difference is significant, this is a new frame
-            if (delta >= MIN_DELTA_NS) {
-                uniqueFrames.push_back(timestamps[i].first);
-                lastTimestamp = currentTimestamp;
-            }
-        }
-
-        spdlog::info("Identified {} unique frames from {} total frames",
-                     uniqueFrames.size(), timestamps.size());
-        return uniqueFrames;
-    }
-
     OpenPoseInterface::ProcessingResult processRecording(
         const fs::path& recordingDir,
         ICoordinateMapper* coordinateMapper,
@@ -353,7 +315,7 @@ public:
     }
 
     // Sort frames and check if we found any
-    std::sort(framesToProcess.begin(), framesToProcess.end());
+    std::ranges::sort(framesToProcess);
     if (framesToProcess.empty()) {
         spdlog::error("No frames identified for processing");
         return result;
@@ -900,7 +862,7 @@ private:
             // Post-processing for stability - filter obvious outliers
             if (!person3D.keypoints.empty() && !validDepths.empty()) {
                 // Calculate median depth
-                std::sort(validDepths.begin(), validDepths.end());
+                std::ranges::sort(validDepths);
                 const float medianDepth = validDepths[validDepths.size() / 2];
 
                 // Reject outliers (points more than 50% from median)
@@ -1051,10 +1013,15 @@ cv::Mat OpenPoseInterface::visualize3DSkeleton(
     // Define the skeleton connections
     static const std::vector<std::pair<int, int>> connections = {
         {0, 1}, {1, 2}, {1, 5}, {1, 8}, {2, 3}, {3, 4}, {5, 6},
-        {6, 7}, {8, 9}, {8, 12}, {9, 10}, {10, 11}, {12, 13}, {13, 14}
+        {6, 7}, {8, 9}, {8, 12}, {9, 10}, {10, 11}, {12, 13}, {13, 14},
+        // Head connections
+        {0, 15}, {0, 16},
+        {15, 17}, {16, 18},
+        // Feet connections
+     {11, 22}, {11, 24},
+     {14, 21}, {14, 23}
     };
 
-    // Add a title with frame information
     cv::putText(result, "3D Skeleton Reconstruction",
                cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8,
                cv::Scalar(0, 0, 255), 2);
@@ -1128,15 +1095,15 @@ cv::Mat OpenPoseInterface::visualize3DSkeleton(
         }
     }
 
-    // Add a depth scale bar
-    int scaleWidth = 30;
-    int scaleHeight = 200;
-    int scaleX = result.cols - scaleWidth - 20;
-    int scaleY = 50;
+    // Depth scale bar
+    constexpr int scaleWidth = 30;
+    constexpr int scaleHeight = 200;
+    const int scaleX = result.cols - scaleWidth - 20;
+    constexpr int scaleY = 50;
 
     // Draw depth scale gradient
     for (int y = 0; y < scaleHeight; y++) {
-        float normalizedZ = 1.0f - (float)y / scaleHeight;
+        float normalizedZ = 1.0f - static_cast<float>(y) / scaleHeight;
         cv::Scalar color(255 * (1.0f - normalizedZ), 0, 255 * normalizedZ);
         cv::rectangle(result,
                      cv::Point(scaleX, scaleY + y),
@@ -1144,7 +1111,7 @@ cv::Mat OpenPoseInterface::visualize3DSkeleton(
                      color, -1);
     }
 
-    // Add labels to scale
+    // Labels to scale
     cv::putText(result, "0m", cv::Point(scaleX + scaleWidth + 5, scaleY + scaleHeight),
                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
     cv::putText(result, "5m", cv::Point(scaleX + scaleWidth + 5, scaleY),
