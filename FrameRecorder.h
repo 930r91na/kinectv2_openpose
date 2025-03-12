@@ -29,7 +29,6 @@ public:
         int processEveryNFrames = 1;
         std::string outputDirectory = "recordings";
         bool saveOriginalFrames = true;
-        bool saveOverlayFrames = false;
     };
 
     // Frame data structure
@@ -71,7 +70,6 @@ public:
 
     // Status and statistics
     int getFrameCount() const noexcept;
-    std::optional<RecordingStats> getRecordingStats() const;
 
     // Options
     void setRecordingOptions(const RecordingOptions& newOptions);
@@ -100,10 +98,10 @@ private:
 
     // Helper methods
     bool saveFrameToDisk(const FrameData& frame, int frameIndex);
-    std::string generateUniqueSessionId() const;
+    std::string generateUniqueSessionId(const std::string& sessionId) const;
 
     // New helper methods
-    cv::Mat getFrameFromBestSource(int frameIndex);
+    cv::Mat getFrameFromSource(int frameIndex) const;
     cv::Mat createFrameWithOverlay(const cv::Mat& originalFrame, int frameIndex);
 
     // Member variables

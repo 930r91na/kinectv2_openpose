@@ -10,7 +10,6 @@ namespace fs = std::filesystem;
 FrameRecorder::FrameRecorder(RecordingOptions opts)
     : options(std::move(opts)) {
 
-    // Ensure output directory exists
     if (!fs::exists(options.outputDirectory)) {
         try {
             fs::create_directories(options.outputDirectory);
@@ -145,8 +144,8 @@ bool FrameRecorder::addFrame(const cv::Mat& colorFrame, const cv::Mat& depthFram
 
     // Create a new frame data object
     FrameData frameData;
-    frameData.colorImage = colorFrame.clone();
-    frameData.depthImage = depthFrame.clone();
+    frameData.colorImage = std::move(const_cast<cv::Mat&>(colorFrame));
+    frameData.depthImage = std::move(const_cast<cv::Mat&>(depthFrame));
     frameData.timestamp = std::chrono::system_clock::now();
 
     // Store timestamp
@@ -178,53 +177,6 @@ int FrameRecorder::getFrameCount() const noexcept {
     return currentSession ? currentSession->frameCounter.load() : 0;
 }
 
-std::optional<FrameRecorder::RecordingStats> FrameRecorder::getRecordingStats() const {
-    if (!currentSession) {
-        return std::nullopt;
-    }
-
-    RecordingStats stats;
-    stats.totalFrames = currentSession->frameCounter;
-
-    // Calculate duration
-    auto now = std::chrono::system_clock::now();
-    stats.recordingDurationSeconds = std::chrono::duration<double>(
-        now - currentSession->startTime).count();
-
-    // Calculate FPS
-    if (stats.recordingDurationSeconds > 0) {
-        stats.averageFps = stats.totalFrames / stats.recordingDurationSeconds;
-    }
-
-    stats.outputPath = currentSession->outputPath.string();
-
-    // Count saved files
-    try {
-        if (options.useVideoCompression &&
-            fs::exists(currentSession->outputPath / "color.mp4")) {
-            stats.colorFramesSaved = 1; // Video file
-        } else if (fs::exists(currentSession->outputPath / "color")) {
-            for (const auto& entry : fs::directory_iterator(currentSession->outputPath / "color")) {
-                if (entry.path().extension() == ".png") {
-                    stats.colorFramesSaved++;
-                }
-            }
-        }
-
-        if (fs::exists(currentSession->outputPath / "depth_raw")) {
-            for (const auto& entry : fs::directory_iterator(currentSession->outputPath / "depth_raw")) {
-                if (entry.path().extension() == ".bin") {
-                    stats.depthFramesSaved++;
-                }
-            }
-        }
-    } catch (const fs::filesystem_error&) {
-        // Ignore filesystem errors when getting stats
-    }
-
-    return stats;
-}
-
 void FrameRecorder::setRecordingOptions(const RecordingOptions& newOptions) {
     if (isRecordingActive) {
         spdlog::warn("Cannot change options while recording is active");
@@ -248,8 +200,7 @@ std::vector<FrameRecorder::FrameData> FrameRecorder::loadRecordedFrames(const st
     }
 
     // Check for required directories
-    bool hasVideoFile = fs::exists(directory + "/color.mp4");
-    bool hasColorDir = fs::exists(directory + "/color");
+    bool hasVideoFile = fs::exists(directory + "/videoStandard.mp4") || fs::exists(directory + "/videoCompressed.mp4");
     bool hasProcessingDir = fs::exists(directory + "/processing_temp");
 
     // Check for processing temp directory first as it contains uncompressed originals
@@ -260,9 +211,6 @@ std::vector<FrameRecorder::FrameData> FrameRecorder::loadRecordedFrames(const st
         frameSourceDir = directory + "/processing_temp";
         useProcessingTemp = true;
         spdlog::info("Using processing_temp directory for frames");
-    } else if (hasColorDir) {
-        frameSourceDir = directory + "/color";
-        spdlog::info("Using color directory for frames");
     } else if (hasVideoFile) {
         frameSourceDir = directory;
         spdlog::info("Using video file for frames");
@@ -332,11 +280,15 @@ std::vector<FrameRecorder::FrameData> FrameRecorder::loadRecordedFrames(const st
 
     // Open video capture if using video
     cv::VideoCapture videoCapture;
-    if (hasVideoFile && !useProcessingTemp && !hasColorDir) {
-        videoCapture.open(directory + "/color.mp4");
+    if (hasVideoFile && !useProcessingTemp) {
+        videoCapture.open(directory + "/videoStandard.mp4");
         if (!videoCapture.isOpened()) {
-            spdlog::error("Failed to open color video file");
-            return frames;
+            videoCapture.open(directory + "/videoCompressed.mp4");
+            if (!videoCapture.isOpened())
+            {
+                spdlog::error("Failed to open color video file");
+                return frames;
+            }
         }
     }
 
@@ -352,17 +304,10 @@ std::vector<FrameRecorder::FrameData> FrameRecorder::loadRecordedFrames(const st
                 spdlog::warn("Failed to load color frame {} from processing_temp", frameIdx);
                 continue;
             }
-        } else if (hasVideoFile && !hasColorDir) {
+        } else if (hasVideoFile) {
             videoCapture.set(cv::CAP_PROP_POS_FRAMES, frameIdx);
             if (!videoCapture.read(frame.colorImage)) {
                 spdlog::warn("Failed to read color frame {} from video", frameIdx);
-                continue;
-            }
-        } else {
-            std::string colorPath = (fs::path(directory) / "color" / ("frame_" + std::to_string(frameIdx) + ".png")).string();
-            frame.colorImage = cv::imread(colorPath);
-            if (frame.colorImage.empty()) {
-                spdlog::warn("Failed to load color frame {}", frameIdx);
                 continue;
             }
         }
@@ -400,7 +345,7 @@ std::vector<FrameRecorder::FrameData> FrameRecorder::loadRecordedFrames(const st
         }
     }
 
-    if (hasVideoFile && !useProcessingTemp && !hasColorDir) {
+    if (hasVideoFile && !useProcessingTemp) {
         videoCapture.release();
     }
 
@@ -461,11 +406,10 @@ void FrameRecorder::processFrameQueue() {
     spdlog::debug("Frame processing thread finished after processing {} frames", processedFrames);
 }
 
-std::string FrameRecorder::generateUniqueSessionId() const {
-    // Create a timestamp-based session ID
-    auto now = std::chrono::system_clock::now();
+std::string FrameRecorder::generateUniqueSessionId(const std::string& sessionId) const {
+    const auto now = std::chrono::system_clock::now();
     auto timestamp = std::chrono::system_clock::to_time_t(now);
-    struct tm t;
+    tm t{};
 
 #ifdef _WIN32
     localtime_s(&t, &timestamp);
@@ -474,15 +418,23 @@ std::string FrameRecorder::generateUniqueSessionId() const {
 #endif
 
     std::stringstream ss;
-    ss << "recording_" << std::put_time(&t, "%Y%m%d_%H%M%S");
+
+    if (sessionId.empty())
+    {
+        ss << "recording_" << std::put_time(&t, "%Y%m%d_%H%M%S");
+    } else
+    {
+        ss << sessionId << std::put_time(&t, "%Y%m%d_%H%M%S");
+    }
 
     return ss.str();
 }
 
-cv::Mat FrameRecorder::getFrameFromBestSource(int frameIndex) {
+cv::Mat FrameRecorder::getFrameFromSource(int frameIndex) const
+{
     cv::Mat frame;
 
-    // Try processing_temp first (original frames without overlay)
+    // Try processing_temp first
     if (fs::exists(currentSession->outputPath / "processing_temp")) {
         std::string framePath = (currentSession->outputPath / "processing_temp" /
             ("frame_" + std::to_string(frameIndex) + ".png")).string();
@@ -492,32 +444,12 @@ cv::Mat FrameRecorder::getFrameFromBestSource(int frameIndex) {
                 return frame;
             }
         }
-    }
-
-    // Fall back to color directory if needed
-    if (fs::exists(currentSession->outputPath / "color")) {
-        std::string framePath = (currentSession->outputPath / "color" /
-            ("frame_" + std::to_string(frameIndex) + ".png")).string();
-        if (fs::exists(framePath)) {
-            frame = cv::imread(framePath);
-        }
+    }else
+    {
+        spdlog::error("Directory processing_temp does not have the necessary files");
     }
 
     return frame;
-}
-
-// For creating overlay on-demand without storing it
-cv::Mat FrameRecorder::createFrameWithOverlay(const cv::Mat& originalFrame, int frameIndex) {
-    if (originalFrame.empty()) {
-        return originalFrame;
-    }
-
-    cv::Mat overlayFrame = originalFrame.clone();
-    cv::putText(overlayFrame, "Frame: " + std::to_string(frameIndex),
-               cv::Point(30, 30), cv::FONT_HERSHEY_SIMPLEX, 1.0,
-               cv::Scalar(0, 255, 0), 2);
-
-    return overlayFrame;
 }
 
 bool FrameRecorder::stopRecording() {
@@ -547,7 +479,7 @@ bool FrameRecorder::stopRecording() {
     // Write final metadata
     if (currentSession->metadataStream.is_open()) {
         auto end_time_t = std::chrono::system_clock::to_time_t(endTime);
-        struct tm t;
+        tm t;
 #ifdef _WIN32
         localtime_s(&t, &end_time_t);
 #else
@@ -561,11 +493,29 @@ bool FrameRecorder::stopRecording() {
         currentSession->metadataStream.close();
     }
 
-    // If video compression is enabled, create the video file now with the actual FPS
-    if (options.useVideoCompression && totalFrames > 0) {
-        std::string videoPath = (currentSession->outputPath / "color.mp4").string();
+    // Video creation code - for both compressed and standard formats
+    if (totalFrames > 0) {
+        // Determine the video path and parameters based on compression option
+        std::string videoPath;
+        double targetFps;
+        bool duplicateFrames;
+        std::string videoType;
 
-        // Get dimensions from first frame - prioritize processing_temp for clean frames
+        if (options.useVideoCompression) {
+            // Compressed video uses actual FPS, no frame duplication
+            videoPath = (currentSession->outputPath / "videoCompressed.mp4").string();
+            targetFps = actualFps;  // Use actual FPS for compressed video
+            duplicateFrames = false;
+            videoType = "compressed";
+        } else {
+            // Standard video uses 30 FPS with frame duplication
+            videoPath = (currentSession->outputPath / "videoStandard.mp4").string();
+            targetFps = 30.0;  // Standard FPS
+            duplicateFrames = true;
+            videoType = "standard";
+        }
+
+        // Common code to find the first frame
         cv::Mat firstFrame;
         bool useProcessingTemp = fs::exists(currentSession->outputPath / "processing_temp");
 
@@ -574,35 +524,15 @@ bool FrameRecorder::stopRecording() {
             std::string firstFramePath = (currentSession->outputPath / "processing_temp" / "frame_0.png").string();
             if (fs::exists(firstFramePath)) {
                 firstFrame = cv::imread(firstFramePath);
-                spdlog::info("Using clean frames from processing_temp for video creation");
+                spdlog::info("Using frames from processing_temp for video creation");
             }
         }
 
-        // Fall back to color directory if processing_temp doesn't have frames
-        if (firstFrame.empty() && fs::exists(currentSession->outputPath / "color")) {
-            std::string firstFramePath = (currentSession->outputPath / "color" / "frame_0.png").string();
-            if (fs::exists(firstFramePath)) {
-                firstFrame = cv::imread(firstFramePath);
-                spdlog::info("Using overlay frames from color directory for video creation");
-            }
-        }
-
-        // Search for any available frame as a last resort
+        // Search for any available frame
         if (firstFrame.empty()) {
             for (int i = 1; i < totalFrames; i++) {
-                std::string framePath;
-
                 if (useProcessingTemp) {
-                    framePath = (currentSession->outputPath / "processing_temp" /
-                        ("frame_" + std::to_string(i) + ".png")).string();
-                    if (fs::exists(framePath)) {
-                        firstFrame = cv::imread(framePath);
-                        break;
-                    }
-                }
-
-                if (firstFrame.empty() && fs::exists(currentSession->outputPath / "color")) {
-                    framePath = (currentSession->outputPath / "color" /
+                    std::string framePath = (currentSession->outputPath / "processing_temp" /
                         ("frame_" + std::to_string(i) + ".png")).string();
                     if (fs::exists(framePath)) {
                         firstFrame = cv::imread(framePath);
@@ -615,10 +545,7 @@ bool FrameRecorder::stopRecording() {
         if (firstFrame.empty()) {
             spdlog::error("Could not find any frames to create video!");
         } else {
-            // Use a standard frame rate for the video writer (30 fps is standard)
-            double standardFps = 30.0;
-
-            // Try different video codecs in case one fails
+            // Common code for video writer setup
             std::vector<std::pair<std::string, int>> codecs = {
                 {"XVID", cv::VideoWriter::fourcc('X', 'V', 'I', 'D')},
                 {"MJPG", cv::VideoWriter::fourcc('M', 'J', 'P', 'G')},
@@ -628,9 +555,10 @@ bool FrameRecorder::stopRecording() {
             cv::VideoWriter videoWriter;
             bool videoWriterCreated = false;
 
+            // Try different codecs
             for (const auto& codec : codecs) {
                 spdlog::info("Trying codec: {}", codec.first);
-                videoWriter.open(videoPath, codec.second, standardFps, firstFrame.size());
+                videoWriter.open(videoPath, codec.second, targetFps, firstFrame.size());
 
                 if (videoWriter.isOpened()) {
                     videoWriterCreated = true;
@@ -642,82 +570,111 @@ bool FrameRecorder::stopRecording() {
             if (!videoWriterCreated) {
                 spdlog::error("Failed to create video writer at {} with any codec", videoPath);
             } else {
-                spdlog::info("Creating MP4 video with standard FPS: {:.2f} (actual: {:.2f})", standardFps, actualFps);
+                spdlog::info("Creating {} MP4 video with FPS: {:.2f}", videoType, targetFps);
 
-                // Calculate the frame duplication factor to maintain timing
-                double frameRepeatFactor = standardFps / actualFps;
-
-                // Total frames to create in the output video
-                int totalOutputFrames = static_cast<int>(std::ceil(totalFrames * frameRepeatFactor));
-                spdlog::info("Frame repeat factor: {:.2f}, output will have approximately {} frames",
-                           frameRepeatFactor, totalOutputFrames);
-
-                // Create timing map - which original frame should be shown at each output frame
-                std::vector<int> frameMap(totalOutputFrames);
-                for (int outFrame = 0; outFrame < totalOutputFrames; outFrame++) {
-                    // Calculate the corresponding source frame
-                    double sourceFrameExact = outFrame / frameRepeatFactor;
-                    int sourceFrame = std::min(static_cast<int>(sourceFrameExact), totalFrames - 1);
-                    frameMap[outFrame] = sourceFrame;
-                }
-
-                // Track loaded frames to avoid redundant disk reads
+                // Setup for frame processing
                 std::unordered_map<int, cv::Mat> frameCache;
-                int lastFrame = -1;
                 cv::Mat currentFrame;
-
-                // Determine which directory to load frames from
-                fs::path frameSourceDir;
-                if (useProcessingTemp) {
-                    frameSourceDir = currentSession->outputPath / "processing_temp";
-                } else {
-                    frameSourceDir = currentSession->outputPath / "color";
-                }
-
-                // Write video with frame repeating to maintain timing
+                fs::path frameSourceDir = currentSession->outputPath / "processing_temp";
                 int framesWritten = 0;
-                for (int outFrame = 0; outFrame < totalOutputFrames; outFrame++) {
-                    int sourceFrame = frameMap[outFrame];
 
-                    // Only load a new frame from disk if needed
-                    if (sourceFrame != lastFrame) {
-                        // Check if frame is already in cache
-                        auto cacheIt = frameCache.find(sourceFrame);
+                // Different logic based on whether we're duplicating frames
+                if (duplicateFrames) {
+                    // Calculate frame duplication factor
+                    double frameRepeatFactor = targetFps / actualFps;
+                    int totalOutputFrames = static_cast<int>(std::ceil(totalFrames * frameRepeatFactor));
+
+                    spdlog::info("Frame repeat factor: {:.2f}, output will have approximately {} frames",
+                               frameRepeatFactor, totalOutputFrames);
+
+                    // Create timing map for duplicated frames
+                    std::vector<int> frameMap(totalOutputFrames);
+                    for (int outFrame = 0; outFrame < totalOutputFrames; outFrame++) {
+                        double sourceFrameExact = outFrame / frameRepeatFactor;
+                        int sourceFrame = std::min(static_cast<int>(sourceFrameExact), totalFrames - 1);
+                        frameMap[outFrame] = sourceFrame;
+                    }
+
+                    // Track the last frame to avoid reloading
+                    int lastFrame = -1;
+
+                    // Process frames with duplication
+                    for (int outFrame = 0; outFrame < totalOutputFrames; outFrame++) {
+                        int sourceFrame = frameMap[outFrame];
+
+                        // Only load a new frame from disk if needed
+                        if (sourceFrame != lastFrame) {
+                            // Load frame (using cache if available)
+                            auto cacheIt = frameCache.find(sourceFrame);
+                            if (cacheIt != frameCache.end()) {
+                                currentFrame = cacheIt->second;
+                            } else {
+                                std::string framePath = (frameSourceDir /
+                                    ("frame_" + std::to_string(sourceFrame) + ".png")).string();
+                                if (fs::exists(framePath)) {
+                                    currentFrame = cv::imread(framePath);
+                                    // Cache frame
+                                    if (frameCache.size() < 10) {
+                                        frameCache[sourceFrame] = currentFrame;
+                                    }
+                                } else {
+                                    // If frame is missing, use the last valid frame
+                                    spdlog::warn("Frame {} not found, using previous frame", sourceFrame);
+                                    if (currentFrame.empty() && !frameCache.empty()) {
+                                        currentFrame = frameCache.begin()->second;
+                                    }
+                                }
+                            }
+                            lastFrame = sourceFrame;
+                        }
+
+                        // Write the frame
+                        if (!currentFrame.empty()) {
+                            videoWriter.write(currentFrame);
+                            framesWritten++;
+
+                            // Log progress periodically
+                            if (outFrame % 100 == 0 || outFrame == totalOutputFrames - 1) {
+                                spdlog::info("Video creation progress: {:.1f}% ({}/{})",
+                                          (100.0 * outFrame) / totalOutputFrames,
+                                          outFrame + 1, totalOutputFrames);
+                            }
+                        }
+                    }
+                } else {
+                    // Process frames without duplication (compressed version)
+                    for (int frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+                        // Load frame (using cache if available)
+                        auto cacheIt = frameCache.find(frameIndex);
                         if (cacheIt != frameCache.end()) {
                             currentFrame = cacheIt->second;
                         } else {
-                            // Load frame from disk
                             std::string framePath = (frameSourceDir /
-                                ("frame_" + std::to_string(sourceFrame) + ".png")).string();
+                                ("frame_" + std::to_string(frameIndex) + ".png")).string();
                             if (fs::exists(framePath)) {
                                 currentFrame = cv::imread(framePath);
-
-                                // Cache frame (keep cache size reasonable)
-                                if (frameCache.size() < 10) {  // Cache up to 10 frames
-                                    frameCache[sourceFrame] = currentFrame;
+                                // Cache frame
+                                if (frameCache.size() < 10) {
+                                    frameCache[frameIndex] = currentFrame;
                                 }
                             } else {
-                                // If frame is missing, use the last valid frame
-                                spdlog::warn("Frame {} not found, using previous frame", sourceFrame);
-                                if (currentFrame.empty() && !frameCache.empty()) {
-                                    // Get any frame from cache if current is empty
-                                    currentFrame = frameCache.begin()->second;
-                                }
+                                // Skip if frame is missing
+                                spdlog::warn("Frame {} not found, skipping", frameIndex);
+                                continue;
                             }
                         }
-                        lastFrame = sourceFrame;
-                    }
 
-                    // Write the frame
-                    if (!currentFrame.empty()) {
-                        videoWriter.write(currentFrame);
-                        framesWritten++;
+                        // Write the frame
+                        if (!currentFrame.empty()) {
+                            videoWriter.write(currentFrame);
+                            framesWritten++;
 
-                        // Log progress periodically
-                        if (outFrame % 100 == 0 || outFrame == totalOutputFrames - 1) {
-                            spdlog::info("Video creation progress: {:.1f}% ({}/{})",
-                                       (100.0 * outFrame) / totalOutputFrames,
-                                       outFrame + 1, totalOutputFrames);
+                            // Log progress periodically
+                            if (frameIndex % 100 == 0 || frameIndex == totalFrames - 1) {
+                                spdlog::info("Video creation progress: {:.1f}% ({}/{})",
+                                          (100.0 * frameIndex) / totalFrames,
+                                          frameIndex + 1, totalFrames);
+                            }
                         }
                     }
                 }
@@ -734,18 +691,21 @@ bool FrameRecorder::stopRecording() {
                     timingFile << "  Duration: " << duration.count() << " seconds" << std::endl;
                     timingFile << "  Actual FPS: " << actualFps << std::endl << std::endl;
 
-                    timingFile << "Video conversion information:" << std::endl;
-                    timingFile << "  Standard FPS: " << standardFps << std::endl;
-                    timingFile << "  Frame repeat factor: " << frameRepeatFactor << std::endl;
-                    timingFile << "  Total output frames: " << totalOutputFrames << std::endl;
-                    timingFile << "  Actual frames written: " << framesWritten << std::endl;
-                    timingFile << "  Output duration: " << (framesWritten / standardFps) << " seconds" << std::endl;
+                    timingFile << "Video information:" << std::endl;
+                    if (duplicateFrames) {
+                        timingFile << "  Type: Standard video with frame duplication" << std::endl;
+                        timingFile << "  Standard FPS: " << targetFps << std::endl;
+                        timingFile << "  Frame repeat factor: " << (targetFps / actualFps) << std::endl;
+                    } else {
+                        timingFile << "  Type: Compressed video with original timing" << std::endl;
+                        timingFile << "  Used FPS: " << targetFps << std::endl;
+                        timingFile << "  No frame duplication - using original timing" << std::endl;
+                    }
+                    timingFile << "  Total frames: " << framesWritten << std::endl;
+                    timingFile << "  Output duration: " << (framesWritten / targetFps) << " seconds" << std::endl;
 
                     timingFile.close();
                 }
-
-                // We keep both the individual frame files and processing_temp directory
-                // to allow for faster processing
             }
         }
     }
@@ -826,23 +786,13 @@ bool FrameRecorder::stopRecording() {
         summaryFile << "Target FPS: " << options.targetFps << std::endl;
         summaryFile << "Output directory: " << currentSession->outputPath.string() << std::endl;
         summaryFile << "Original frames saved: " << (options.saveOriginalFrames ? "Yes" : "No") << std::endl;
-        summaryFile << "Overlay frames saved: " << (options.saveOverlayFrames ? "Yes" : "No") << std::endl;
 
         // Count files to verify
         try {
             if (options.useVideoCompression &&
-                fs::exists(currentSession->outputPath / "color.mp4")) {
+                fs::exists(currentSession->outputPath / "colorCompressed.mp4")) {
                 summaryFile << "Color format: MP4 video" << std::endl;
                 summaryFile << "Video playback: Standard 30 FPS with timing preserved" << std::endl;
-            } else if (fs::exists(currentSession->outputPath / "color")) {
-                size_t colorFrames = 0;
-                for (const auto& entry : fs::directory_iterator(currentSession->outputPath / "color")) {
-                    if (entry.path().extension() == ".png") {
-                        colorFrames++;
-                    }
-                }
-                summaryFile << "Color format: PNG sequence" << std::endl;
-                summaryFile << "Color frames: " << colorFrames << std::endl;
             }
 
             if (fs::exists(currentSession->outputPath / "depth_raw")) {
@@ -891,7 +841,7 @@ bool FrameRecorder::startRecording(const std::string& sessionId) {
     currentSession->frameCounter = 0;
 
     // Create a unique session ID if not provided
-    std::string actualSessionId = sessionId.empty() ? generateUniqueSessionId() : sessionId;
+    std::string actualSessionId = generateUniqueSessionId(sessionId);
 
     // Create output directory
     std::string outputDir = options.outputDirectory + "/" + actualSessionId;
@@ -901,11 +851,6 @@ bool FrameRecorder::startRecording(const std::string& sessionId) {
         // Create necessary directories
         fs::create_directories(currentSession->outputPath);
         fs::create_directories(currentSession->outputPath / "depth_raw");
-
-        // Create color directory only if overlay frames are enabled
-        if (options.saveOverlayFrames) {
-            fs::create_directories(currentSession->outputPath / "color");
-        }
 
         // Create processing_temp directory if saving original frames
         if (options.saveOriginalFrames) {
@@ -941,7 +886,6 @@ bool FrameRecorder::startRecording(const std::string& sessionId) {
         currentSession->metadataStream << "Video compression: " << (options.useVideoCompression ? "enabled" : "disabled") << std::endl;
         currentSession->metadataStream << "Process every N frames: " << options.processEveryNFrames << std::endl;
         currentSession->metadataStream << "Save original frames: " << (options.saveOriginalFrames ? "enabled" : "disabled") << std::endl;
-        currentSession->metadataStream << "Save overlay frames: " << (options.saveOverlayFrames ? "enabled" : "disabled") << std::endl;
 
         // Start the processing thread
         shouldProcessFrames = true;
@@ -983,28 +927,6 @@ bool FrameRecorder::saveFrameToDisk(const FrameData& frame, int frameIndex) {
             }
         } catch (const cv::Exception& e) {
             spdlog::error("Failed to save original image: {}", e.what());
-            success = false;
-        }
-    }
-
-    // Only save frames with overlay if explicitly enabled
-    if (options.saveOverlayFrames) {
-        try {
-            std::string colorPath = (currentSession->outputPath / "color" /
-                ("frame_" + std::to_string(frameIndex) + ".png")).string();
-
-            // Add frame number overlay to a copy of the image
-            cv::Mat imageWithOverlay = frame.colorImage.clone();
-            cv::putText(imageWithOverlay, "Frame: " + std::to_string(frameIndex),
-                       cv::Point(30, 30), cv::FONT_HERSHEY_SIMPLEX, 1.0,
-                       cv::Scalar(0, 255, 0), 2);
-
-            if (!cv::imwrite(colorPath, imageWithOverlay)) {
-                spdlog::warn("Failed to write color frame {} to {}", frameIndex, colorPath);
-                success = false;
-            }
-        } catch (const cv::Exception& e) {
-            spdlog::error("Failed to save overlay image: {}", e.what());
             success = false;
         }
     }
@@ -1064,7 +986,7 @@ bool FrameRecorder::saveFrameToDisk(const FrameData& frame, int frameIndex) {
         std::lock_guard<std::mutex> lock(metadataMutex);
 
         auto timestamp = std::chrono::system_clock::to_time_t(frame.timestamp);
-        struct tm buf;
+        tm buf;
 #ifdef _WIN32
             gmtime_s(&buf, &timestamp);
 #else

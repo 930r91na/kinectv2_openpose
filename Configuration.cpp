@@ -2,6 +2,7 @@
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <iomanip>
 #include <ranges>
 
@@ -116,7 +117,7 @@ bool Configuration::saveToFile(const std::filesystem::path& path) const {
 }
 
 bool Configuration::reload() {
-    if (!std::filesystem::exists(configFilePath)) {
+    if (!exists(configFilePath)) {
         spdlog::error("Cannot reload: configuration file {} doesn't exist",
                       configFilePath.string());
         return false;

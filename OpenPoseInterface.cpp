@@ -236,8 +236,7 @@ public:
 
     // STEP 1: Determine which source to use - prioritize processing_temp
     fs::path processingTempDir = recordingDir / "processing_temp";
-    fs::path colorDir = recordingDir / "color";
-    fs::path videoPath = recordingDir / "color.mp4";
+    fs::path videoPath = recordingDir / "videoStandard.mp4";
 
     // Simply check which source exists and use the best one available
     fs::path frameSourceDir;
@@ -246,9 +245,6 @@ public:
     if (fs::exists(processingTempDir)) {
         frameSourceDir = processingTempDir;
         spdlog::info("Using pre-extracted frames from processing_temp directory");
-    } else if (fs::exists(colorDir)) {
-        frameSourceDir = colorDir;
-        spdlog::info("Using frames from color directory");
     } else if (fs::exists(videoPath)) {
         useVideo = true;
         spdlog::info("Using video file for frame extraction");

@@ -371,9 +371,9 @@ void Application::updateFrame() {
         // Create a blank canvas with dark background
         displayFrame = cv::Mat(720, 1280, CV_8UC3, cv::Scalar(40, 40, 40));
 
-        // Calculate appropriate dimensions for visualizations
-        int maxSkeletonWidth = 600;  // Maximum width for skeleton visualization
-        int maxSkeletonHeight = 400; // Maximum height for skeleton visualization
+        // Skeleton window visualizations
+        int maxSkeletonWidth = 600;
+        int maxSkeletonHeight = 400;
 
         // Resize color frame for display with proper dimensions
         cv::Mat resizedColor;
