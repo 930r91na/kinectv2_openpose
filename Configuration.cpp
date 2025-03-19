@@ -21,6 +21,7 @@ Configuration::Configuration(std::filesystem::path configPath)
     settings["frame_rate_limit"] = 30;
     settings["enable_frame_limiting"] = true;
     settings["use_video_compression"] = true;
+    settings["minimal_recording_mode"] = true;
 
     // Try to load from file if it exists
     if (std::filesystem::exists(configFilePath)) {

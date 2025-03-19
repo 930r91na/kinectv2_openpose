@@ -363,6 +363,39 @@ void Application::updateFrame() {
     // Record frame if recording is active
     if (isRecording() && depthFrame && colorFrame) {
         recorder->addFrame(*colorFrame, *depthFrame);
+
+        // If in minimal recording mode, skip all visualization
+        if (config->getValueOr<bool>("minimal_recording_mode", false)) {
+            try {
+                // Create a resized version of the color frame for display
+                // This avoids processing the full resolution frame for display
+                cv::Mat smallColorFrame;
+
+                // Resize to a reasonable display size (e.g., 640x360 for 16:9 aspect ratio)
+                // This significantly reduces the processing needed for display
+                cv::resize(*colorFrame, smallColorFrame, cv::Size(640, 360));
+
+                // Optional: Add a small frame counter in the corner with minimal impact
+                cv::putText(smallColorFrame,
+                           std::to_string(recorder->getFrameCount()),
+                           cv::Point(10, 30),
+                           cv::FONT_HERSHEY_SIMPLEX,
+                           0.7,
+                           cv::Scalar(0, 0, 255),
+                           1);
+
+                // Display just the resized color frame
+                renderFrame(smallColorFrame);
+                return;
+            } catch (const cv::Exception& e) {
+                spdlog::error("OpenCV exception in minimal display: {}", e.what());
+                // Fall back to no display
+                return;
+            } catch (const std::exception& e) {
+                spdlog::error("Exception in minimal display: {}", e.what());
+                return;
+            }
+        }
     }
 
     // Create visualization

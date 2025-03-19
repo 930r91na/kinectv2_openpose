@@ -277,10 +277,14 @@ public:
         }
     }
 
-    // If no frames list found, scan the directory for frame files
+    // If no frames list found, scan the directory for frame files (PNG or JPEG/JPG)
     if (framesToProcess.empty() && !useVideo) {
+        std::unordered_map<int, std::string> frameFiles;  // Map frame index to file path
+
         for (const auto& entry : fs::directory_iterator(frameSourceDir)) {
-            if (entry.path().extension() == ".png") {
+            std::string ext = entry.path().extension().string();
+            // Support both PNG and JPEG formats
+            if (ext == ".png" || ext == ".jpg" || ext == ".jpeg") {
                 std::string filename = entry.path().filename().string();
                 size_t underscorePos = filename.find('_');
                 size_t dotPos = filename.find('.');
@@ -288,14 +292,16 @@ public:
                 if (underscorePos != std::string::npos && dotPos != std::string::npos) {
                     std::string indexStr = filename.substr(underscorePos + 1, dotPos - underscorePos - 1);
                     try {
-                        framesToProcess.push_back(std::stoi(indexStr));
+                        int frameIndex = std::stoi(indexStr);
+                        frameFiles[frameIndex] = entry.path().string();
+                        framesToProcess.push_back(frameIndex);
                     } catch (...) {
                         // Skip files with invalid indices
                     }
                 }
             }
         }
-        spdlog::info("Found {} frames in directory scan", framesToProcess.size());
+        spdlog::info("Found {} frames in directory scan (PNG and JPEG)", framesToProcess.size());
     } else if (framesToProcess.empty() && useVideo) {
         // For video, we need to sample frames if no list is available
         cv::VideoCapture tempCapture(videoPath.string());
@@ -356,15 +362,42 @@ public:
                     continue;
                 }
             } else {
-                std::string framePath = (frameSourceDir / ("frame_" + std::to_string(frameIdx) + ".png")).string();
-                if (!fs::exists(framePath)) {
-                    spdlog::warn("Frame {} not found in {}", frameIdx, frameSourceDir.string());
-                    continue;
+                // Try to load the frame using different possible extensions
+                bool frameLoaded = false;
+
+                // Try PNG first
+                std::string pngPath = (frameSourceDir / ("frame_" + std::to_string(frameIdx) + ".png")).string();
+                if (fs::exists(pngPath)) {
+                    colorImage = cv::imread(pngPath);
+                    if (!colorImage.empty()) {
+                        frameLoaded = true;
+                    }
                 }
 
-                colorImage = cv::imread(framePath);
-                if (colorImage.empty()) {
-                    spdlog::warn("Failed to load frame {}", frameIdx);
+                // Try JPG if PNG failed
+                if (!frameLoaded) {
+                    std::string jpgPath = (frameSourceDir / ("frame_" + std::to_string(frameIdx) + ".jpg")).string();
+                    if (fs::exists(jpgPath)) {
+                        colorImage = cv::imread(jpgPath);
+                        if (!colorImage.empty()) {
+                            frameLoaded = true;
+                        }
+                    }
+                }
+
+                // Try JPEG if PNG and JPG failed
+                if (!frameLoaded) {
+                    std::string jpegPath = (frameSourceDir / ("frame_" + std::to_string(frameIdx) + ".jpeg")).string();
+                    if (fs::exists(jpegPath)) {
+                        colorImage = cv::imread(jpegPath);
+                        if (!colorImage.empty()) {
+                            frameLoaded = true;
+                        }
+                    }
+                }
+
+                if (!frameLoaded) {
+                    spdlog::warn("Failed to load frame {} in any supported format", frameIdx);
                     continue;
                 }
             }
@@ -1014,8 +1047,8 @@ cv::Mat OpenPoseInterface::visualize3DSkeleton(
         {0, 15}, {0, 16},
         {15, 17}, {16, 18},
         // Feet connections
-     {11, 22}, {11, 24},
-     {14, 21}, {14, 23}
+        {11, 24}, {23, 22}, {11,22},
+        {14, 21}, {19, 20}, {14,19}
     };
 
     cv::putText(result, "3D Skeleton Reconstruction",

@@ -11,8 +11,10 @@
 #include <optional>
 #include <chrono>
 #include <fstream>
+#include <future>
 #include <opencv2/opencv.hpp>
 
+class IOThreadPool;
 /**
  * @brief Modern frame recorder for Kinect data
  *
@@ -23,12 +25,15 @@ class FrameRecorder {
 public:
     // Configuration options
     struct RecordingOptions {
-        bool useVideoCompression = true;
+        bool useVideoCompression = false;
         int targetFps = 30;
         bool limitFrameRate = false;
         int processEveryNFrames = 1;
         std::string outputDirectory = "recordings";
         bool saveOriginalFrames = true;
+        bool generateVideoOnRecording = false;
+        bool useJpegForColorFrames = true;
+        int jpegQuality = 90;
     };
 
     // Frame data structure
@@ -36,16 +41,6 @@ public:
         cv::Mat colorImage;
         cv::Mat depthImage;
         std::chrono::system_clock::time_point timestamp;
-    };
-
-    // Statistics from a recording session
-    struct RecordingStats {
-        int totalFrames = 0;
-        int colorFramesSaved = 0;
-        int depthFramesSaved = 0;
-        double recordingDurationSeconds = 0.0;
-        double averageFps = 0.0;
-        std::string outputPath;
     };
 
     // Constructor and destructor
@@ -74,6 +69,7 @@ public:
     // Options
     void setRecordingOptions(const RecordingOptions& newOptions);
     const RecordingOptions& getRecordingOptions() const noexcept;
+    void createRecordingVideo(int totalFrames, double actualFps, std::chrono::duration<double> duration);
 
     // Load recorded frames
     static std::vector<FrameData> loadRecordedFrames(const std::string& directory);
@@ -96,8 +92,18 @@ private:
     // Processing thread function
     void processFrameQueue();
 
+    // Thread pool for I/O operations
+    std::unique_ptr<IOThreadPool> ioPool;
+
+    // Pending operation tracking
+    std::map<uint64_t, std::future<void>> pendingOperations;
+    std::mutex pendingOpsMutex;
+    size_t maxConcurrentOperations;
+
     // Helper methods
-    bool saveFrameToDisk(const FrameData& frame, int frameIndex);
+    bool saveFrameToDisk(const FrameData& frame, int frameIndex, uint64_t operationId);
+    void cleanupCompletedOperations();
+    void waitForOperationsIfNeeded();
     std::string generateUniqueSessionId(const std::string& sessionId) const;
 
     // New helper methods

@@ -4,12 +4,87 @@
 #include <iomanip>
 #include <fstream>
 #include <algorithm>
+#include <future>
+#include <condition_variable>
+#include <queue>
 
 namespace fs = std::filesystem;
 
-FrameRecorder::FrameRecorder(RecordingOptions opts)
-    : options(std::move(opts)) {
+// I/O Thread Pool for controlled parallelism
+class IOThreadPool {
+public:
+    explicit IOThreadPool(size_t numThreads) : stop(false) {
+        for (size_t i = 0; i < numThreads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(queueMutex);
+                        condition.wait(lock, [this] {
+                            return !tasks.empty() || stop;
+                        });
 
+                        if (stop && tasks.empty()) {
+                            return;
+                        }
+
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    template<class F>
+    std::future<void> enqueue(F&& f) {
+        auto task = std::make_shared<std::packaged_task<void()>>(std::forward<F>(f));
+        std::future<void> result = task->get_future();
+
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            if (stop) {
+                throw std::runtime_error("ThreadPool is stopped");
+            }
+            tasks.emplace([task]() { (*task)(); });
+        }
+
+        condition.notify_one();
+        return result;
+    }
+
+    size_t pendingTasks() const {
+        std::unique_lock<std::mutex> lock(queueMutex);
+        return tasks.size();
+    }
+
+    ~IOThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    mutable std::mutex queueMutex;
+    std::condition_variable condition;
+    bool stop;
+};
+
+FrameRecorder::FrameRecorder(RecordingOptions opts)
+    : options(std::move(opts)),
+      ioPool(std::make_unique<IOThreadPool>(std::thread::hardware_concurrency() - 4)), // cpu has 10
+      maxConcurrentOperations(16) { // Limit concurrent operations
+    spdlog::info("Number of threads in pool: {}", std::thread::hardware_concurrency() - 4);
     if (!fs::exists(options.outputDirectory)) {
         try {
             fs::create_directories(options.outputDirectory);
@@ -23,7 +98,13 @@ FrameRecorder::FrameRecorder(RecordingOptions opts)
 FrameRecorder::~FrameRecorder() {
     // Make sure recording is stopped
     if (isRecordingActive) {
-        stopRecording();
+        try {
+            stopRecording();
+        } catch (const std::exception& e) {
+            spdlog::error("Exception during stopRecording in destructor: {}", e.what());
+        } catch (...) {
+            spdlog::error("Unknown exception during stopRecording in destructor");
+        }
     }
 
     // Make sure processing thread is stopped
@@ -31,7 +112,19 @@ FrameRecorder::~FrameRecorder() {
     queueCondition.notify_all();
 
     if (processingThread.joinable()) {
-        processingThread.join();
+        try {
+            processingThread.join();
+        } catch (const std::exception& e) {
+            spdlog::error("Exception joining processing thread: {}", e.what());
+        }
+    }
+
+    // Handle any remaining pending operations
+    try {
+        std::lock_guard<std::mutex> lock(pendingOpsMutex);
+        pendingOperations.clear();
+    } catch (...) {
+        spdlog::error("Exception clearing pending operations in destructor");
     }
 }
 
@@ -39,12 +132,20 @@ FrameRecorder::FrameRecorder(FrameRecorder&& other) noexcept
     : options(std::move(other.options)),
       currentSession(std::move(other.currentSession)),
       isRecordingActive(other.isRecordingActive.load()),
-      shouldProcessFrames(other.shouldProcessFrames.load()) {
+      shouldProcessFrames(other.shouldProcessFrames.load()),
+      ioPool(std::move(other.ioPool)),
+      maxConcurrentOperations(other.maxConcurrentOperations) {
 
     // Move queued frames
     {
         std::lock_guard<std::mutex> lock(other.queueMutex);
         frameQueue = std::move(other.frameQueue);
+    }
+
+    // Move pending operations
+    {
+        std::lock_guard<std::mutex> lock(other.pendingOpsMutex);
+        pendingOperations = std::move(other.pendingOperations);
     }
 
     // Handle processing thread
@@ -78,16 +179,68 @@ FrameRecorder& FrameRecorder::operator=(FrameRecorder&& other) noexcept {
             processingThread.join();
         }
 
+        // Wait for all pending file operations to complete with timeout and exception handling
+        {
+            std::lock_guard<std::mutex> lock(pendingOpsMutex);
+            spdlog::info("Waiting for {} pending file operations to complete", pendingOperations.size());
+
+            for (auto it = pendingOperations.begin(); it != pendingOperations.end(); ) {
+                try {
+                    // First check if already done without waiting
+                    if (it->second.valid() &&
+                        it->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                        it = pendingOperations.erase(it);
+                        continue;
+                        }
+
+                    // Not done - wait with timeout for safety
+                    if (it->second.valid()) {
+                        auto status = it->second.wait_for(std::chrono::seconds(1));
+                        if (status == std::future_status::ready || status == std::future_status::deferred) {
+                            it = pendingOperations.erase(it);
+                            continue;
+                        } else {
+                            // Timed out - log and move on
+                            spdlog::warn("Operation {} timed out, continuing shutdown", it->first);
+                            ++it;
+                        }
+                    } else {
+                        // Invalid future - remove and continue
+                        it = pendingOperations.erase(it);
+                    }
+                } catch (const std::exception& e) {
+                    // Handle any exceptions from futures
+                    spdlog::error("Exception while waiting for operation {}: {}", it->first, e.what());
+                    it = pendingOperations.erase(it);
+                } catch (...) {
+                    // Catch all other exceptions
+                    spdlog::error("Unknown exception while waiting for operation {}", it->first);
+                    it = pendingOperations.erase(it);
+                }
+            }
+
+            pendingOperations.clear();
+            spdlog::info("All pending operations handled");
+        }
+
         // Move data from other
         options = std::move(other.options);
         currentSession = std::move(other.currentSession);
         isRecordingActive = other.isRecordingActive.load();
         shouldProcessFrames = other.shouldProcessFrames.load();
+        ioPool = std::move(other.ioPool);
+        maxConcurrentOperations = other.maxConcurrentOperations;
 
         // Move queued frames
         {
             std::lock_guard<std::mutex> lock(other.queueMutex);
             frameQueue = std::move(other.frameQueue);
+        }
+
+        // Move pending operations
+        {
+            std::lock_guard<std::mutex> lock(other.pendingOpsMutex);
+            pendingOperations = std::move(other.pendingOperations);
         }
 
         // Stop other's processing thread
@@ -142,10 +295,10 @@ bool FrameRecorder::addFrame(const cv::Mat& colorFrame, const cv::Mat& depthFram
         return false;
     }
 
-    // Create a new frame data object
+    // Create a new frame data object - use cv::Mat's reference counting
     FrameData frameData;
-    frameData.colorImage = std::move(const_cast<cv::Mat&>(colorFrame));
-    frameData.depthImage = std::move(const_cast<cv::Mat&>(depthFrame));
+    frameData.colorImage = colorFrame; // Uses reference counting
+    frameData.depthImage = depthFrame; // Uses reference counting
     frameData.timestamp = std::chrono::system_clock::now();
 
     // Store timestamp
@@ -153,13 +306,16 @@ bool FrameRecorder::addFrame(const cv::Mat& colorFrame, const cv::Mat& depthFram
         frameData.timestamp.time_since_epoch()).count();
     currentSession->frameTimestamps.push_back(timestampNs);
 
+    // More aggressive frame queue management
+    const int OPTIMAL_QUEUE_SIZE = 20; // Balanced for throughput vs memory usage
+
     // Add to processing queue
     {
         std::unique_lock<std::mutex> lock(queueMutex);
 
         // Wait if queue is full to prevent excessive memory usage
-        queueCondition.wait(lock, [this] {
-            return frameQueue.size() < MAX_QUEUE_SIZE || !isRecordingActive;
+        queueCondition.wait(lock, [this, OPTIMAL_QUEUE_SIZE] {
+            return frameQueue.size() < OPTIMAL_QUEUE_SIZE || !isRecordingActive;
         });
 
         if (!isRecordingActive) {
@@ -190,173 +346,54 @@ const FrameRecorder::RecordingOptions& FrameRecorder::getRecordingOptions() cons
     return options;
 }
 
-std::vector<FrameRecorder::FrameData> FrameRecorder::loadRecordedFrames(const std::string& directory) {
-    std::vector<FrameData> frames;
+// Helper function to clean up completed operations
+void FrameRecorder::cleanupCompletedOperations() {
+    std::lock_guard<std::mutex> lock(pendingOpsMutex);
 
-    // Validate directory
-    if (!fs::exists(directory)) {
-        spdlog::error("Directory does not exist: {}", directory);
-        return frames;
-    }
-
-    // Check for required directories
-    bool hasVideoFile = fs::exists(directory + "/videoStandard.mp4") || fs::exists(directory + "/videoCompressed.mp4");
-    bool hasProcessingDir = fs::exists(directory + "/processing_temp");
-
-    // Check for processing temp directory first as it contains uncompressed originals
-    fs::path frameSourceDir;
-    bool useProcessingTemp = false;
-
-    if (hasProcessingDir) {
-        frameSourceDir = directory + "/processing_temp";
-        useProcessingTemp = true;
-        spdlog::info("Using processing_temp directory for frames");
-    } else if (hasVideoFile) {
-        frameSourceDir = directory;
-        spdlog::info("Using video file for frames");
-    } else {
-        spdlog::error("No valid frame source found in {}", directory);
-        return frames;
-    }
-
-    // Get list of frames to load
-    std::vector<int> framesToLoad;
-
-    // First check if we have a processing_frames.txt file
-    if (fs::exists(directory + "/process_frames.txt")) {
-        try {
-            std::ifstream frameListFile(directory + "/process_frames.txt");
-            if (frameListFile.is_open()) {
-                std::string line;
-                while (std::getline(frameListFile, line)) {
-                    try {
-                        int frameIndex = std::stoi(line);
-                        framesToLoad.push_back(frameIndex);
-                    } catch (...) {
-                        // Skip invalid lines
-                    }
-                }
-                frameListFile.close();
-                spdlog::info("Loaded {} frames from process_frames.txt", framesToLoad.size());
-            }
-        } catch (const std::exception& e) {
-            spdlog::error("Error reading process_frames.txt: {}", e.what());
-        }
-    }
-
-    // If no specific list, scan directory
-    if (framesToLoad.empty()) {
-        fs::path scanDir = useProcessingTemp ? frameSourceDir : directory + "/depth_raw";
-
-        // Scan for file pattern
-        for (const auto& entry : fs::directory_iterator(scanDir)) {
-            std::string filename = entry.path().filename().string();
-            // Extract frame number from "frame_X.bin" or "frame_X.png"
-            size_t underscorePos = filename.find('_');
-            size_t dotPos = filename.find('.');
-
-            if (underscorePos != std::string::npos && dotPos != std::string::npos) {
-                std::string indexStr = filename.substr(underscorePos + 1, dotPos - underscorePos - 1);
-                try {
-                    int frameIndex = std::stoi(indexStr);
-                    framesToLoad.push_back(frameIndex);
-                } catch (...) {
-                    // Skip files with invalid indices
-                }
-            }
-        }
-    }
-
-    std::ranges::sort(framesToLoad);
-    spdlog::info("Found {} depth frame files", framesToLoad.size());
-
-    if (framesToLoad.empty()) {
-        spdlog::error("No frames found to load");
-        return frames;
-    }
-
-    // Prepare to load frames
-    frames.reserve(framesToLoad.size());
-
-    // Open video capture if using video
-    cv::VideoCapture videoCapture;
-    if (hasVideoFile && !useProcessingTemp) {
-        videoCapture.open(directory + "/videoStandard.mp4");
-        if (!videoCapture.isOpened()) {
-            videoCapture.open(directory + "/videoCompressed.mp4");
-            if (!videoCapture.isOpened())
-            {
-                spdlog::error("Failed to open color video file");
-                return frames;
-            }
-        }
-    }
-
-    // Load each frame
-    for (int frameIdx : framesToLoad) {
-        FrameData frame;
-
-        // Load color image
-        if (useProcessingTemp) {
-            std::string colorPath = (frameSourceDir / ("frame_" + std::to_string(frameIdx) + ".png")).string();
-            frame.colorImage = cv::imread(colorPath);
-            if (frame.colorImage.empty()) {
-                spdlog::warn("Failed to load color frame {} from processing_temp", frameIdx);
-                continue;
-            }
-        } else if (hasVideoFile) {
-            videoCapture.set(cv::CAP_PROP_POS_FRAMES, frameIdx);
-            if (!videoCapture.read(frame.colorImage)) {
-                spdlog::warn("Failed to read color frame {} from video", frameIdx);
-                continue;
-            }
-        }
-
-        // Load depth data
-        std::string depthPath = (fs::path(directory) / "depth_raw" / ("frame_" + std::to_string(frameIdx) + ".bin")).string();
-        std::ifstream depthFile(depthPath, std::ios::binary);
-
-        if (depthFile.is_open()) {
-            // Read dimensions
-            int rows, cols;
-            depthFile.read(reinterpret_cast<char*>(&rows), sizeof(int));
-            depthFile.read(reinterpret_cast<char*>(&cols), sizeof(int));
-
-            // Read data
-            frame.depthImage = cv::Mat(rows, cols, CV_16UC1);
-            depthFile.read(reinterpret_cast<char*>(frame.depthImage.data),
-                         frame.depthImage.total() * frame.depthImage.elemSize());
-
-            depthFile.close();
+    for (auto it = pendingOperations.begin(); it != pendingOperations.end();) {
+        if (it->second.valid() &&
+            it->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            it = pendingOperations.erase(it);
         } else {
-            spdlog::warn("Failed to load depth data for frame {}", frameIdx);
-            continue;
-        }
-
-        // Set timestamp - just use frame index as we don't have actual timestamps
-        frame.timestamp = std::chrono::system_clock::now() +
-            std::chrono::milliseconds(frameIdx * 33); // Approximate 30fps
-
-        frames.push_back(std::move(frame));
-
-        // Log progress for large datasets
-        if (frames.size() % 100 == 0) {
-            spdlog::info("Loaded {}/{} frames", frames.size(), framesToLoad.size());
+            ++it;
         }
     }
-
-    if (hasVideoFile && !useProcessingTemp) {
-        videoCapture.release();
-    }
-
-    spdlog::info("Successfully loaded {} frames", frames.size());
-    return frames;
 }
 
+// Wait for operations to complete if we've reached the limit
+void FrameRecorder::waitForOperationsIfNeeded() {
+    std::lock_guard<std::mutex> lock(pendingOpsMutex);
+
+    // First try to cleanup completed operations
+    for (auto it = pendingOperations.begin(); it != pendingOperations.end();) {
+        if (it->second.valid() &&
+            it->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            it = pendingOperations.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // If we still have too many operations, wait for the oldest one
+    if (pendingOperations.size() >= maxConcurrentOperations && !pendingOperations.empty()) {
+        // Find the oldest operation (lowest ID)
+        auto oldestOp = std::min_element(pendingOperations.begin(), pendingOperations.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        if (oldestOp != pendingOperations.end() && oldestOp->second.valid()) {
+            // Wait for it to complete
+            oldestOp->second.wait();
+            pendingOperations.erase(oldestOp);
+        }
+    }
+}
+
+// Process frames from the queue
 void FrameRecorder::processFrameQueue() {
     spdlog::debug("Frame processing thread started");
 
     int processedFrames = 0;
+    uint64_t operationId = 0; // For tracking operations
 
     while (shouldProcessFrames) {
         FrameData frame;
@@ -386,8 +423,11 @@ void FrameRecorder::processFrameQueue() {
 
             // Process the frame
             try {
-                // Save frame to disk
-                saveFrameToDisk(frame, frameIndex);
+                // Wait if we have too many pending operations
+                waitForOperationsIfNeeded();
+
+                // Save frame to disk using the thread pool
+                saveFrameToDisk(frame, frameIndex, operationId++);
 
                 // Log progress periodically
                 if (processedFrames % 30 == 0) {
@@ -395,7 +435,15 @@ void FrameRecorder::processFrameQueue() {
                         std::chrono::system_clock::now() - currentSession->startTime).count();
                     double fps = processedFrames / elapsedSec;
 
-                    spdlog::info("Processed {} frames ({:.1f} FPS)", processedFrames, fps);
+                    // Also report pending operations
+                    std::lock_guard<std::mutex> lock(pendingOpsMutex);
+                    spdlog::info("Processed {} frames ({:.1f} FPS), Pending I/O: {}, Queue: {}",
+                               processedFrames, fps, pendingOperations.size(), frameQueue.size());
+                }
+
+                // Periodically clean up completed operations
+                if (processedFrames % 10 == 0) {
+                    cleanupCompletedOperations();
                 }
             } catch (const std::exception& e) {
                 spdlog::error("Error processing frame {}: {}", frameIndex, e.what());
@@ -444,8 +492,7 @@ cv::Mat FrameRecorder::getFrameFromSource(int frameIndex) const
                 return frame;
             }
         }
-    }else
-    {
+    } else {
         spdlog::error("Directory processing_temp does not have the necessary files");
     }
 
@@ -457,43 +504,161 @@ bool FrameRecorder::stopRecording() {
         return false;
     }
 
-    spdlog::info("Stopping recording...");
+    try {
+        spdlog::info("Stopping recording...");
 
-    // Mark as not recording
-    isRecordingActive = false;
+        // First mark as not recording to stop accepting new frames
+        isRecordingActive = false;
 
-    // Wait for all frames to be processed
-    {
-        std::unique_lock<std::mutex> lock(queueMutex);
-        queueCondition.wait(lock, [this] { return frameQueue.empty(); });
-    }
+        // Wait for queue to drain with timeout
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            auto waitResult = queueCondition.wait_for(lock,
+                                std::chrono::seconds(5), // 5 second timeout
+                                [this] { return frameQueue.empty(); });
 
-    // Finalize recording
-    auto endTime = std::chrono::system_clock::now();
-    std::chrono::duration<double> duration = endTime - currentSession->startTime;
+            if (!waitResult) {
+                // Timed out - log the warning and continue
+                spdlog::warn("Timeout waiting for frame queue to empty, proceeding with {} frames in queue",
+                           frameQueue.size());
+                // Clear queue to prevent further processing
+                std::queue<FrameData>().swap(frameQueue); // Efficiently clear the queue
+            }
+        }
 
-    // Calculate actual FPS
-    int totalFrames = currentSession->frameCounter;
-    double actualFps = totalFrames / duration.count();
+        // Safely stop processing thread
+        shouldProcessFrames = false;
+        queueCondition.notify_all();
 
-    // Write final metadata
-    if (currentSession->metadataStream.is_open()) {
+        if (processingThread.joinable()) {
+            // Create a future to handle thread joining with timeout
+            std::future<void> joinFuture = std::async(std::launch::async, [&]() {
+                if (processingThread.joinable()) {
+                    processingThread.join();
+                }
+            });
+
+            // Wait with timeout
+            if (joinFuture.wait_for(std::chrono::seconds(3)) == std::future_status::timeout) {
+                spdlog::warn("Processing thread join timed out, proceeding with shutdown");
+                // We can't safely terminate the thread, so we'll leak it
+                // This is safer than crashing
+            }
+        }
+
+        // Handle pending operations with extreme caution
+        try {
+            std::lock_guard<std::mutex> lock(pendingOpsMutex);
+            spdlog::info("Handling {} pending file operations...", pendingOperations.size());
+
+            // Don't try to wait for all operations - it could hang
+            // Just log and clear them
+            pendingOperations.clear();
+            spdlog::info("Cleared pending operations");
+        } catch (const std::exception& e) {
+            spdlog::error("Exception clearing pending operations: {}", e.what());
+            // Continue shutdown anyway
+        }
+
+        // Finalize recording data
+        auto endTime = std::chrono::system_clock::now();
         auto end_time_t = std::chrono::system_clock::to_time_t(endTime);
-        tm t;
-#ifdef _WIN32
-        localtime_s(&t, &end_time_t);
-#else
-        localtime_r(&end_time_t, &t);
-#endif
-        currentSession->metadataStream << "Recording ended at: "
-            << std::put_time(&t, "%Y-%m-%d %H:%M:%S") << std::endl;
-        currentSession->metadataStream << "Total frames: " << totalFrames << std::endl;
-        currentSession->metadataStream << "Recording duration (seconds): " << duration.count() << std::endl;
-        currentSession->metadataStream << "Actual FPS: " << actualFps << std::endl;
-        currentSession->metadataStream.close();
-    }
+        std::chrono::duration<double> duration = endTime - currentSession->startTime;
+        int totalFrames = currentSession->frameCounter;
+        double actualFps = totalFrames > 0 ? totalFrames / duration.count() : 0.0;
 
-    // Video creation code - for both compressed and standard formats
+        // Close metadata file safely
+        try {
+            if (currentSession->metadataStream.is_open()) {
+                // Write basic summary data
+                tm timeinfo;
+#ifdef _WIN32
+                localtime_s(&timeinfo, &end_time_t);
+#else
+                localtime_r(&end_time_t, &timeinfo);
+#endif
+
+                currentSession->metadataStream << "Recording ended at: "
+                    << std::put_time(&timeinfo, "%Y-%m-%d %H:%M:%S") << std::endl
+                    << "Total frames: " << totalFrames << std::endl
+                    << "Recording duration (seconds): " << duration.count() << std::endl
+                    << "Actual FPS: " << actualFps << std::endl;
+                currentSession->metadataStream.close();
+            }
+        } catch (const std::exception& e) {
+            spdlog::error("Error writing metadata: {}", e.what());
+            // Continue shutdown
+        }
+
+        // Save frame timestamps for analysis
+        try {
+            if (!currentSession->frameTimestamps.empty()) {
+                std::string timestampPath = (currentSession->outputPath / "frame_timestamps.csv").string();
+                std::ofstream timestampFile(timestampPath);
+
+                if (timestampFile.is_open()) {
+                    // Write CSV header
+                    timestampFile << "frame_index,timestamp_ns,elapsed_ms,delta_ms\n";
+
+                    int64_t startTs = currentSession->frameTimestamps.front();
+                    int64_t prevTs = startTs;
+
+                    for (size_t i = 0; i < currentSession->frameTimestamps.size(); i++) {
+                        int64_t ts = currentSession->frameTimestamps[i];
+                        int64_t elapsedMs = (ts - startTs) / 1000000;
+                        int64_t deltaMs = (ts - prevTs) / 1000000;
+
+                        timestampFile << i << "," << ts << "," << elapsedMs << "," << deltaMs << std::endl;
+                        prevTs = ts;
+                    }
+
+                    timestampFile.close();
+                    spdlog::info("Timestamp data saved to: {}", timestampPath);
+                } else {
+                    spdlog::error("Failed to open timestamp file for writing: {}", timestampPath);
+                }
+            }
+        } catch (const std::exception& e) {
+            spdlog::error("Error saving timestamp data: {}", e.what());
+            // Continue shutdown
+        }
+
+        // Generate video completely separated from I/O operations
+        try {
+            if (totalFrames > 0 && options.generateVideoOnRecording) {
+                createRecordingVideo(totalFrames, actualFps, duration);
+            }
+        } catch (const std::exception& e) {
+            spdlog::error("Error creating video: {}", e.what());
+            // Continue shutdown
+        }
+
+        std::string timingPath = (currentSession->outputPath / "video_timing.txt").string();
+        std::ofstream timingFile(timingPath);
+        if (timingFile.is_open())
+        {
+            timingFile << "Original recording information:" << std::endl;
+            timingFile << "  Total frames: " << totalFrames << std::endl;
+            timingFile << "  Duration: " << duration.count() << " seconds" << std::endl;
+            timingFile << "  Actual FPS: " << actualFps << std::endl << std::endl;
+        }
+
+        // Log success even if some parts failed
+        spdlog::info("Recording stopped. Captured {} frames over {:.2f} seconds ({:.2f} FPS)",
+                    totalFrames, duration.count(), actualFps);
+
+        return true;
+    } catch (const std::exception& e) {
+        spdlog::error("Critical error during stopRecording: {}", e.what());
+        return false;
+    } catch (...) {
+        spdlog::error("Unknown error during stopRecording");
+        return false;
+    }
+}
+
+void FrameRecorder::createRecordingVideo(int totalFrames, double actualFps, std::chrono::duration<double> duration ) {
+    spdlog::info("Creating video file...");
     if (totalFrames > 0) {
         // Determine the video path and parameters based on compression option
         std::string videoPath;
@@ -686,10 +851,6 @@ bool FrameRecorder::stopRecording() {
                 std::string timingPath = (currentSession->outputPath / "video_timing.txt").string();
                 std::ofstream timingFile(timingPath);
                 if (timingFile.is_open()) {
-                    timingFile << "Original recording information:" << std::endl;
-                    timingFile << "  Total frames: " << totalFrames << std::endl;
-                    timingFile << "  Duration: " << duration.count() << " seconds" << std::endl;
-                    timingFile << "  Actual FPS: " << actualFps << std::endl << std::endl;
 
                     timingFile << "Video information:" << std::endl;
                     if (duplicateFrames) {
@@ -703,129 +864,11 @@ bool FrameRecorder::stopRecording() {
                     }
                     timingFile << "  Total frames: " << framesWritten << std::endl;
                     timingFile << "  Output duration: " << (framesWritten / targetFps) << " seconds" << std::endl;
-
                     timingFile.close();
                 }
             }
         }
     }
-
-    // Save frame timestamps for analysis
-    if (!currentSession->frameTimestamps.empty()) {
-        std::string timestampPath = (currentSession->outputPath / "frame_timestamps.csv").string();
-        std::ofstream timestampFile(timestampPath);
-
-        if (timestampFile.is_open()) {
-            // Write CSV header
-            timestampFile << "frame_index,timestamp_ns,elapsed_ms,delta_ms\n";
-
-            int64_t startTs = currentSession->frameTimestamps.front();
-            int64_t prevTs = startTs;
-
-            for (size_t i = 0; i < currentSession->frameTimestamps.size(); i++) {
-                int64_t ts = currentSession->frameTimestamps[i];
-                int64_t elapsedMs = (ts - startTs) / 1000000;
-                int64_t deltaMs = (ts - prevTs) / 1000000;
-
-                timestampFile << i << "," << ts << "," << elapsedMs << "," << deltaMs << std::endl;
-                prevTs = ts;
-            }
-
-            timestampFile.close();
-        }
-    }
-
-    // Save process_frames.txt with the indices of original frames
-    // (not the duplicates created for video)
-    if (options.saveOriginalFrames) {
-        std::string processFramesPath = (currentSession->outputPath / "process_frames.txt").string();
-        std::ofstream processFramesFile(processFramesPath);
-
-        if (processFramesFile.is_open()) {
-            // Look at frameTimestamps to identify original frames
-            if (!currentSession->frameTimestamps.empty()) {
-                constexpr int64_t MIN_DELTA_NS = 50 * 1000000; // 50ms in nanoseconds
-                int64_t lastTs = currentSession->frameTimestamps[0];
-
-                // First frame is always original
-                processFramesFile << "0" << std::endl;
-
-                for (size_t i = 1; i < currentSession->frameTimestamps.size(); i++) {
-                    int64_t ts = currentSession->frameTimestamps[i];
-                    int64_t delta = ts - lastTs;
-
-                    // If significant time has passed, this is an original frame
-                    if (delta >= MIN_DELTA_NS) {
-                        processFramesFile << i << std::endl;
-                        lastTs = ts;
-                    }
-                }
-            } else {
-                // If no timestamps, just use every frame
-                for (int i = 0; i < totalFrames; i++) {
-                    processFramesFile << i << std::endl;
-                }
-            }
-
-            processFramesFile.close();
-            spdlog::info("Created process_frames.txt with original frame indices");
-        }
-    }
-
-    // Generate a summary file
-    std::string summaryPath = (currentSession->outputPath / "recording_summary.txt").string();
-    std::ofstream summaryFile(summaryPath);
-
-    if (summaryFile.is_open()) {
-        summaryFile << "Recording Summary" << std::endl;
-        summaryFile << "----------------" << std::endl;
-        summaryFile << "Session ID: " << currentSession->outputPath.filename().string() << std::endl;
-        summaryFile << "Total frames: " << totalFrames << std::endl;
-        summaryFile << "Recording duration: " << duration.count() << " seconds" << std::endl;
-        summaryFile << "Actual FPS: " << actualFps << std::endl;
-        summaryFile << "Target FPS: " << options.targetFps << std::endl;
-        summaryFile << "Output directory: " << currentSession->outputPath.string() << std::endl;
-        summaryFile << "Original frames saved: " << (options.saveOriginalFrames ? "Yes" : "No") << std::endl;
-
-        // Count files to verify
-        try {
-            if (options.useVideoCompression &&
-                fs::exists(currentSession->outputPath / "colorCompressed.mp4")) {
-                summaryFile << "Color format: MP4 video" << std::endl;
-                summaryFile << "Video playback: Standard 30 FPS with timing preserved" << std::endl;
-            }
-
-            if (fs::exists(currentSession->outputPath / "depth_raw")) {
-                size_t depthFrames = 0;
-                for (const auto& entry : fs::directory_iterator(currentSession->outputPath / "depth_raw")) {
-                    if (entry.path().extension() == ".bin") {
-                        depthFrames++;
-                    }
-                }
-                summaryFile << "Depth frames: " << depthFrames << std::endl;
-            }
-
-            if (fs::exists(currentSession->outputPath / "processing_temp")) {
-                size_t tempFrames = 0;
-                for (const auto& entry : fs::directory_iterator(currentSession->outputPath / "processing_temp")) {
-                    if (entry.path().extension() == ".png") {
-                        tempFrames++;
-                    }
-                }
-                summaryFile << "Processing temp frames: " << tempFrames << std::endl;
-            }
-        } catch (const fs::filesystem_error& e) {
-            summaryFile << "Error counting files: " << e.what() << std::endl;
-        }
-
-        summaryFile.close();
-    }
-
-    spdlog::info("Recording stopped. Captured {} frames over {:.2f} seconds ({:.2f} FPS)",
-                totalFrames, duration.count(), actualFps);
-
-    // Return recording successful
-    return true;
 }
 
 bool FrameRecorder::startRecording(const std::string& sessionId) {
@@ -886,6 +929,9 @@ bool FrameRecorder::startRecording(const std::string& sessionId) {
         currentSession->metadataStream << "Video compression: " << (options.useVideoCompression ? "enabled" : "disabled") << std::endl;
         currentSession->metadataStream << "Process every N frames: " << options.processEveryNFrames << std::endl;
         currentSession->metadataStream << "Save original frames: " << (options.saveOriginalFrames ? "enabled" : "disabled") << std::endl;
+        currentSession->metadataStream << "Using optimized I/O with thread pool: Yes" << std::endl;
+        currentSession->metadataStream << "I/O threads: " << (ioPool ? "4" : "0") << std::endl;
+        currentSession->metadataStream << "Max concurrent operations: " << maxConcurrentOperations << std::endl;
 
         // Start the processing thread
         shouldProcessFrames = true;
@@ -896,10 +942,16 @@ bool FrameRecorder::startRecording(const std::string& sessionId) {
 
         processingThread = std::thread(&FrameRecorder::processFrameQueue, this);
 
+        // Clear any pending operations from previous recordings
+        {
+            std::lock_guard<std::mutex> lock(pendingOpsMutex);
+            pendingOperations.clear();
+        }
+
         // Mark as recording
         isRecordingActive = true;
 
-        spdlog::info("Recording started to {}", currentSession->outputPath.string());
+        spdlog::info("Recording started to {} with optimized I/O", currentSession->outputPath.string());
         return true;
     } catch (const std::exception& e) {
         spdlog::error("Failed to start recording: {}", e.what());
@@ -908,7 +960,43 @@ bool FrameRecorder::startRecording(const std::string& sessionId) {
     }
 }
 
-bool FrameRecorder::saveFrameToDisk(const FrameData& frame, int frameIndex) {
+// Helper functions for async file operations
+static void saveColorToDisk(const cv::Mat& colorImage, const std::string& path, int quality, bool useJpeg) {
+    std::vector<int> params;
+    std::string actualPath = path;
+
+    if (useJpeg) {
+        actualPath = path.substr(0, path.find_last_of('.')) + ".jpg";
+        params = {cv::IMWRITE_JPEG_QUALITY, quality };
+    } else {
+        params = {cv::IMWRITE_PNG_COMPRESSION, 1};
+    }
+
+    imwrite(actualPath, colorImage, params);
+}
+
+static void saveDepthToDisk(const cv::Mat& depthImage, const std::string& path) {
+    int rows = depthImage.rows;
+    int cols = depthImage.cols;
+
+    std::ofstream depthFile(path, std::ios::binary);
+    if (depthFile.is_open()) {
+        // Write dimensions
+        depthFile.write(reinterpret_cast<const char*>(&rows), sizeof(int));
+        depthFile.write(reinterpret_cast<const char*>(&cols), sizeof(int));
+
+        // Write raw depth data
+        depthFile.write(reinterpret_cast<const char*>(depthImage.data),
+                      depthImage.total() * depthImage.elemSize());
+
+        depthFile.close();
+    }
+}
+
+
+
+// Save frame to disk using the thread pool
+bool FrameRecorder::saveFrameToDisk(const FrameData& frame, int frameIndex, uint64_t operationId) {
     if (!currentSession) {
         return false;
     }
@@ -921,12 +1009,24 @@ bool FrameRecorder::saveFrameToDisk(const FrameData& frame, int frameIndex) {
             std::string origPath = (currentSession->outputPath / "processing_temp" /
                 ("frame_" + std::to_string(frameIndex) + ".png")).string();
 
-            if (!cv::imwrite(origPath, frame.colorImage)) {
-                spdlog::warn("Failed to write original frame {} to {}", frameIndex, origPath);
-                success = false;
+            // Queue the color image save operation
+            std::future<void> colorFuture;
+            if (ioPool) {
+                colorFuture = ioPool->enqueue([frame, origPath, this]() {
+                    saveColorToDisk(frame.colorImage, origPath, options.jpegQuality, options.useJpegForColorFrames);
+                });
+
+                // Track this operation
+                {
+                    std::lock_guard<std::mutex> lock(pendingOpsMutex);
+                    pendingOperations[operationId] = std::move(colorFuture);
+                }
+            } else {
+                // Fallback to synchronous save
+                saveColorToDisk(frame.colorImage, origPath, options.jpegQuality, options.useJpegForColorFrames);
             }
-        } catch (const cv::Exception& e) {
-            spdlog::error("Failed to save original image: {}", e.what());
+        } catch (const std::exception& e) {
+            spdlog::error("Failed to save color image: {}", e.what());
             success = false;
         }
     }
@@ -941,46 +1041,31 @@ bool FrameRecorder::saveFrameToDisk(const FrameData& frame, int frameIndex) {
             std::string depthPath = (currentSession->outputPath / "depth_raw" /
                 ("frame_" + std::to_string(frameIndex) + ".bin")).string();
 
-            std::ofstream depthFile(depthPath, std::ios::binary);
+            // Queue the depth data save operation
+            std::future<void> depthFuture;
+            if (ioPool) {
+                depthFuture = ioPool->enqueue([frame, depthPath]() {
+                    saveDepthToDisk(frame.depthImage, depthPath);
+                });
 
-            if (depthFile.is_open()) {
-                int rows = frame.depthImage.rows;
-                int cols = frame.depthImage.cols;
-
-                // Write dimensions
-                depthFile.write(reinterpret_cast<const char*>(&rows), sizeof(int));
-                depthFile.write(reinterpret_cast<const char*>(&cols), sizeof(int));
-
-                // Write raw depth data
-                depthFile.write(reinterpret_cast<const char*>(frame.depthImage.data),
-                              frame.depthImage.total() * frame.depthImage.elemSize());
-
-                depthFile.close();
-
-                // Only index frames that should be processed
-                if (frameIndex % options.processEveryNFrames == 0) {
-                    static std::mutex indexMutex;
-                    std::lock_guard<std::mutex> lock(indexMutex);
-
-                    std::string indexPath = (currentSession->outputPath / "process_frames.txt").string();
-                    std::ofstream indexFile(indexPath, std::ios::app);
-
-                    if (indexFile.is_open()) {
-                        indexFile << frameIndex << std::endl;
-                        indexFile.close();
-                    }
+                // Track this operation
+                {
+                    std::lock_guard<std::mutex> lock(pendingOpsMutex);
+                    pendingOperations[operationId + 1000000] = std::move(depthFuture); // Offset to avoid ID collision
                 }
             } else {
-                spdlog::warn("Failed to open depth file for writing: {}", depthPath);
-                success = false;
+                // Fallback to synchronous save
+                saveDepthToDisk(frame.depthImage, depthPath);
             }
+
+            // Only index frames that should be processed
         } catch (const std::exception& e) {
             spdlog::error("Failed to save depth data: {}", e.what());
             success = false;
         }
     }
 
-    // Update metadata
+    // Update metadata (keep this synchronous for consistency)
     if (currentSession->metadataStream.is_open()) {
         static std::mutex metadataMutex;
         std::lock_guard<std::mutex> lock(metadataMutex);
@@ -988,9 +1073,9 @@ bool FrameRecorder::saveFrameToDisk(const FrameData& frame, int frameIndex) {
         auto timestamp = std::chrono::system_clock::to_time_t(frame.timestamp);
         tm buf;
 #ifdef _WIN32
-            gmtime_s(&buf, &timestamp);
+        gmtime_s(&buf, &timestamp);
 #else
-            gmtime_r(&timestamp, &buf);
+        gmtime_r(&timestamp, &buf);
 #endif
         currentSession->metadataStream << "Frame: " << frameIndex << " Timestamp: "
             << std::put_time(&buf, "%H:%M:%S.")
