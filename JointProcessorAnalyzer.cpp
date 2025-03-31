@@ -710,13 +710,7 @@ bool JointProcessorAnalyzer::exportToJson(const std::filesystem::path& outputPat
                     jointJson["y"] = jointPos.y;
                     jointJson["z"] = jointPos.z;
 
-                    // Add confidence if available
-                    auto confIt = frame.confidences.find(jointId);
-                    if (confIt != frame.confidences.end()) {
-                        jointJson["confidence"] = confIt->second;
-                    } else {
-                        jointJson["confidence"] = 0.0f;
-                    }
+                    // TODO: Add calculated confidence from joints worked
 
                     // Use the joint ID as the key in the JSON
                     filteredJointsJson[std::to_string(jointId)] = jointJson;
