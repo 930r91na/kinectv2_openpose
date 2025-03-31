@@ -6,6 +6,7 @@
 #include <deque>
 #include <Kinect.h>
 
+
 class JointProcessor {
 private:
     std::map<int, std::deque<cv::Point3f>> jointHistory;
@@ -21,7 +22,7 @@ public:
     cv::Point3f getFilteredJointPosition(int jointId, cv::Point3f currentPos, const std::vector<cv::Point3f>* futurePositions, const std::map<int, cv::Point3f>* currentJoints, float timeInterval);
     void updateJointHistory(int jointId, cv::Point3f position);
     void setJointConfidence(int jointId, float confidence) { jointConfidences[jointId] = confidence; }
-    float getJointConfidence(int jointId) const { return jointConfidences.count(jointId) ? jointConfidences.at(jointId) : 0.0f; }
+    float getJointConfidence(int jointId) const { return jointConfidences.contains(jointId) ? jointConfidences.at(jointId) : 0.0f; }
     cv::Point3f interpolateMissingJoint(int jointId, const std::vector<cv::Point3f>* futurePositions);
     cv::Point3f estimateJointFromNeighbors(int jointId, const std::map<int, cv::Point3f>& currentJoints);
     cv::Point3f refineJointWithDepth(int jointId, cv::Point2f joint2D, const cv::Mat& depthImage);

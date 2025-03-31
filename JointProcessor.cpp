@@ -3,8 +3,7 @@
 #include <numeric>
 
 JointProcessor::JointProcessor()
-{
-}
+= default;
 
 JointProcessor::~JointProcessor() = default;
 
@@ -54,7 +53,7 @@ cv::Point3f JointProcessor::getFilteredJointPosition(int jointId, cv::Point3f cu
         }
 
         // No valid data available in either direction
-        return cv::Point3f(0, 0, 0);
+        return {0, 0, 0};
     } else {
         // Valid position, check if we have history
         if (!jointHistory[jointId].empty()) {
@@ -78,7 +77,7 @@ cv::Point3f JointProcessor::getFilteredJointPosition(int jointId, cv::Point3f cu
             }
 
             // Calculate movement distance
-            float distance = cv::norm(currentPos - prevPos);
+            float distance = norm(currentPos - prevPos);
 
             // Use enhanced movement validation based on joint type and time interval
             float maxAllowedMovement = getMaxJointMovement(jointId, timeInterval);
@@ -188,10 +187,10 @@ cv::Point3f JointProcessor::interpolateMissingJoint(int jointId, const std::vect
     // Check if we have any data to work with
     bool hasHistory = false;
     cv::Point3f lastValidHistoryPos(0, 0, 0);
-    int validHistoryCount = 0;
 
     // Find valid history points
     if (!jointHistory[jointId].empty()) {
+        int validHistoryCount = 0;
         for (auto it = jointHistory[jointId].rbegin(); it != jointHistory[jointId].rend(); ++it) {
             if (!(it->x == 0 && it->y == 0 && it->z == 0)) {
                 if (validHistoryCount == 0) {
@@ -205,10 +204,10 @@ cv::Point3f JointProcessor::interpolateMissingJoint(int jointId, const std::vect
 
     // Check for valid future points
     bool hasFuture = false;
-    int validFutureCount = 0;
     cv::Point3f firstValidFuturePos(0, 0, 0);
 
     if (futurePositions && !futurePositions->empty()) {
+        int validFutureCount = 0;
         for (const auto& pos : *futurePositions) {
             if (!(pos.x == 0 && pos.y == 0 && pos.z == 0)) {
                 if (validFutureCount == 0) {
@@ -316,7 +315,7 @@ cv::Point3f JointProcessor::estimateJointFromNeighbors(int jointId, const std::m
     // If there are no defined relationships for this joint, return zero
     auto it = jointConnections.find(jointId);
     if (it == jointConnections.end()) {
-        return cv::Point3f(0, 0, 0);
+        return {0, 0, 0};
     }
     
     cv::Point3f estimatedPosition(0, 0, 0);
@@ -344,7 +343,7 @@ cv::Point3f JointProcessor::estimateJointFromNeighbors(int jointId, const std::m
         return estimatedPosition;
     }
     
-    return cv::Point3f(0, 0, 0);
+    return {0, 0, 0};
 }
 
 cv::Point3f JointProcessor::refineJointWithDepth(int jointId, cv::Point2f joint2D, const cv::Mat& depthImage) {
@@ -355,7 +354,7 @@ cv::Point3f JointProcessor::refineJointWithDepth(int jointId, cv::Point2f joint2
     if (joint2D.x < halfPatch || joint2D.y < halfPatch || 
         joint2D.x >= depthImage.cols - halfPatch || 
         joint2D.y >= depthImage.rows - halfPatch) {
-        return cv::Point3f(0, 0, 0);
+        return {0, 0, 0};
     }
     
     // Extract depth patch around joint
@@ -382,7 +381,7 @@ cv::Point3f JointProcessor::refineJointWithDepth(int jointId, cv::Point2f joint2
     }
     
     if (depthValues.empty()) {
-        return cv::Point3f(0, 0, 0);
+        return {0, 0, 0};
     }
     
     // Find median depth
@@ -390,7 +389,7 @@ cv::Point3f JointProcessor::refineJointWithDepth(int jointId, cv::Point2f joint2
     float medianDepth = depthValues[depthValues.size() / 2];
 
     // Return the 3D position
-    return cv::Point3f(joint2D.x, joint2D.y, medianDepth);
+    return {joint2D.x, joint2D.y, medianDepth};
 }
 
 float JointProcessor::getMaxJointMovement(int jointId, float timeInterval) const {
@@ -524,7 +523,7 @@ bool JointProcessor::isValidJointMovement(int jointId,
                 }
 
                 // Calculate movement
-                float connectedDist = cv::norm(connectedCurrent - connectedPrev);
+                float connectedDist = norm(connectedCurrent - connectedPrev);
                 float connectedMaxMove = getMaxJointMovement(connJointId, timeInterval);
 
                 // Update stats
